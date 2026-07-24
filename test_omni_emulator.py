@@ -44,5 +44,38 @@ class HmacTests(unittest.TestCase):
         self.assertEqual(sig, e.hmac_hex(device_token.encode(), msg.encode()))
 
 
+class OutcomeTests(unittest.TestCase):
+    def test_approved_has_auth_fields(self):
+        o = e.decide_outcome(1000, mode="approve", error_code="909")  # magic ..00
+        self.assertEqual(o["status"], "approved")
+        self.assertEqual(o["responseCode"], "000")
+        self.assertRegex(o["stan"], r"^\d{6}$")
+        self.assertRegex(o["authNumber"], r"^\d{6}$")
+        self.assertTrue(o["cardNumber"].startswith("5"))
+        self.assertEqual(o["cardScheme"], "MASTERCARD")
+
+    def test_magic_beats_mode(self):
+        # amount forces declined even though mode=approve
+        o = e.decide_outcome(1005, mode="approve", error_code="909")
+        self.assertEqual(o["status"], "declined")
+
+    def test_error_mode_uses_code(self):
+        o = e.decide_outcome(1042, mode="error", error_code="insufficient_funds")
+        self.assertEqual(o["status"], "declined")
+        self.assertEqual(o["responseCode"], "116")
+
+    def test_timeout_and_cancelled(self):
+        self.assertEqual(e.decide_outcome(1051, "approve", "909")["status"], "timeout")
+        self.assertEqual(e.decide_outcome(1008, "approve", "909")["status"], "cancelled")
+
+    def test_pay_result_shape(self):
+        o = e.decide_outcome(1000, "approve", "909")
+        r = e.pay_result("ORDER-1", 1000, o)
+        self.assertEqual(r["ref"], "ORDER-1")
+        self.assertEqual(r["amountCents"], 1000)
+        self.assertEqual(r["status"], "approved")
+        self.assertIn("transactionDate", r)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -87,3 +87,66 @@ def device_auth_header(device_token: str, method: str, path: str, body: bytes) -
     ts = str(int(time.time()))
     sig = device_sig(device_token, ts, method, path, body)
     return f"OMNI-TOKEN tokenId={device_token},ts={ts},sig={sig}"
+
+
+# ── Outcome engine ──────────────────────────────────────────────────────────
+def _gen_stan() -> str:  return f"{random.randint(1, 999999):06d}"
+def _gen_auth() -> str:  return f"{random.randint(100000, 999999)}"
+def _gen_rrn() -> str:   return f"{random.randint(0, 10**12 - 1):012d}"
+
+MASKED_CARD = "516794******3315"
+CARD_SCHEME = "MASTERCARD"
+
+
+def decide_outcome(amount_centimes: int, mode: str, error_code: str) -> dict:
+    """Resolve a payment to an outcome. Magic amount overrides mode."""
+    status = magic_outcome(amount_centimes)
+    rc = "000"
+
+    if status is None:
+        if mode == "approve":
+            status = "approved"
+        elif mode == "decline":
+            status, rc = "declined", "005"
+        elif mode == "error":
+            status, rc = "declined", resolve_code(error_code)
+        elif mode == "timeout":
+            status = "timeout"
+        else:  # "interactive" — caller overrides this with ask_operator(); default approve
+            status = "approved"
+    elif status == "declined":
+        rc = "005"
+
+    out = {"status": status, "responseCode": rc if status in ("approved", "declined") else None}
+    if status == "approved":
+        now = datetime.now()
+        out.update({
+            "authNumber": _gen_auth(),
+            "stan": _gen_stan(),
+            "rrn": _gen_rrn(),
+            "cardNumber": MASKED_CARD,
+            "cardScheme": CARD_SCHEME,
+            "transactionDate": now.strftime("%d/%m/%Y"),
+            "transactionTime": now.strftime("%H:%M:%S"),
+        })
+    return out
+
+
+def pay_result(ref: str, amount_centimes: int, outcome: dict,
+               terminal_id: str = "EMU-TID", merchant_id: str = "EMU-MID") -> dict:
+    """Assemble the flat PayResult JSON the SDK expects (LAN /pay + cloud share it)."""
+    return {
+        "status": outcome["status"],
+        "ref": ref,
+        "responseCode": outcome.get("responseCode"),
+        "authNumber": outcome.get("authNumber"),
+        "stan": outcome.get("stan"),
+        "rrn": outcome.get("rrn"),
+        "cardNumber": outcome.get("cardNumber"),
+        "cardScheme": outcome.get("cardScheme"),
+        "terminalId": terminal_id,
+        "merchantId": merchant_id,
+        "transactionDate": outcome.get("transactionDate"),
+        "transactionTime": outcome.get("transactionTime"),
+        "amountCents": amount_centimes,
+    }
