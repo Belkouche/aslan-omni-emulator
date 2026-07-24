@@ -19,7 +19,7 @@ omni_emulator.py
 │                                 /pay /reversal /admin/pos   (OMNI-TOKEN HMAC verified)
 │
 └─ Cloud half (--relay <base>)                acts as a provisioned device on staging
-    ├─ device token: cached in a local file; claim flow if absent
+    ├─ device token: --device-token → cache → shared demo terminal → claim flow
     ├─ SSE client   → GET  <base>/cloud/stream                (OMNI-TOKEN signed)
     ├─ pairing code → POST <base>/cloud/pair/initiate → printed to console
     └─ on PayCommand / ReverseCommand → outcome engine → POST <base>/cloud/pay/:id/result
@@ -59,27 +59,38 @@ pay({ amountCents: 1051 })   → timeout
 
 ---
 
-## Quick start — Cloud
+## Quick start — Cloud (zero setup against staging)
 
 ```bash
-python3 omni_emulator.py --relay
+python3 omni_emulator.py --no-lan --relay
 ```
 
-1. With no cached device token, the emulator runs the **claim flow** and prints a claim URL:
+No credentials, no dashboard step. The emulator connects to real
+`staging-api.aslanpay.ma` as a **shared demo terminal** and is ready in seconds.
+
+1. With no `--device-token` and no cache, the emulator fetches the shared demo terminal's
+   token from the public endpoint and connects:
    ```
-   Activate this device: https://staging-api.aslanpay.ma/devices/claim/<uuid>  (waiting…)
+   [Cloud] using shared demo terminal (Emulator E2E Merchant) — token cached.
+   [Cloud] SSE connected.
    ```
-   Activate it once (external step — dashboard / internal endpoint; see
-   [Notes & caveats](#notes--caveats)). The emulator polls until the device is activated,
-   then caches the token.
-2. Once connected it prints a **pairing code**:
+2. It prints a **pairing code**:
    ```
    [Cloud] pairing code: A1B2C3D4  (enter via pairCloud)
    ```
 3. Your app calls `pairCloud({ pairingCode })` against real staging to obtain its own apiKey
    (the emulator isn't involved in that leg).
 4. `pay` runs through the real staging cloud loop — command pushed to the emulator, outcome
-   posted back.
+   posted back:
+   ```
+   pay({ amountCents: 1000 })   → approved
+   pay({ amountCents: 1005 })   → declined
+   ```
+
+> The demo terminal is shared and read-only-ish: everyone who runs the emulator against
+> staging drives the same demo device. That's fine for integration testing — nothing you do
+> touches a real merchant. To use your **own** provisioned terminal instead, pass
+> `--device-token` (see [Device token](#device-token--re-onboarding)).
 
 ---
 
@@ -147,7 +158,13 @@ Acquisition order on a `--relay` run:
 1. `--device-token <T>` (or the `OMNI_DEVICE_TOKEN` env var) → use it directly. Add
    `--save-token` to persist it to the token file.
 2. Else if the cached file exists and its `cloudBase` matches the target → reuse it.
-3. Else → run the claim flow (prints a claim URL, polls until activated, writes the file).
+3. Else → fetch the **shared demo terminal** token from `GET <base>/devices/demo-token` and
+   cache it. This is the zero-setup path — it just works against staging. (The endpoint is
+   inert unless the server has a demo device configured; if it 404s, the emulator falls
+   through to the next step.)
+4. Else → run the claim flow (prints a claim URL, polls until activated, writes the file).
+   Claim activation is an external step (dashboard); use this only when onboarding your own
+   dedicated terminal rather than the shared demo one.
 
 ```bash
 python3 omni_emulator.py --relay --device-token omni_xxx --save-token
@@ -219,9 +236,10 @@ Examples:
 ```bash
 python3 omni_emulator.py                                     # LAN only, approve all
 python3 omni_emulator.py --mode interactive                  # prompt per payment (LAN)
-python3 omni_emulator.py --relay                             # LAN + cloud (claim if no token)
-python3 omni_emulator.py --relay --device-token omni_xxx --save-token
-python3 omni_emulator.py --relay --reset                     # re-onboard: fresh claim
+python3 omni_emulator.py --no-lan --relay                    # cloud, zero setup (shared demo terminal)
+python3 omni_emulator.py --relay                             # LAN + cloud, zero setup
+python3 omni_emulator.py --relay --device-token omni_xxx --save-token   # your own terminal
+python3 omni_emulator.py --relay --reset                     # wipe cache, re-acquire token
 python3 omni_emulator.py --no-lan --relay --mode error --code insufficient_funds
 ```
 
@@ -229,10 +247,14 @@ python3 omni_emulator.py --no-lan --relay --mode error --code insufficient_funds
 
 ## Notes & caveats
 
-- **Claim activation is external.** The emulator initiates the claim and polls for status,
-  but it cannot activate a device against a merchant itself — that leg happens in the
-  dashboard (or an `internal/devices` endpoint). Once activated, the emulator picks up the
-  token and continues automatically.
+- **Zero-setup uses a shared demo terminal.** Against staging the emulator fetches a shared
+  demo device token from `GET /devices/demo-token` — no credentials in this repo, and the
+  blast radius is that one demo terminal (it can't touch a real merchant). To use your own
+  provisioned terminal, pass `--device-token`.
+- **Claim activation is external.** If you onboard your own device via the claim flow, the
+  emulator initiates the claim and polls for status but cannot activate it itself — that leg
+  happens in the dashboard (or an `internal/devices` endpoint). Once activated, the emulator
+  picks up the token and continues automatically.
 - **Cloud calls are OMNI-TOKEN signed** (not `Bearer`). The emulator signs every device→API
   call with the OMNI-TOKEN scheme the API verifies:
   `Authorization: OMNI-TOKEN tokenId=<...>,ts=<unix>,sig=<hex>`. If your staging is running
