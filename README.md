@@ -61,36 +61,147 @@ pay({ amountCents: 1051 })   → timeout
 
 ## Quick start — Cloud (zero setup against staging)
 
+This is the mode you want when your app talks to the **real** Aslan Omni cloud
+(`staging-api.aslanpay.ma`) instead of a terminal on your LAN — the same path a production
+app uses to reach a terminal sitting in another city. You get the whole cloud round-trip
+without owning a physical terminal and **without any credentials or setup**.
+
+### The mental model — who is who
+
+There are three actors, and it helps to keep them straight:
+
+```
+   ┌────────────┐   pairCloud / pay / reverse   ┌──────────────────────────┐   PayCommand (SSE)   ┌──────────────┐
+   │  Your app  │ ────────────────────────────▶ │   staging-api.aslanpay   │ ───────────────────▶ │   emulator   │
+   │ (Omni SDK) │ ◀──────────────────────────── │   .ma/omni  (the cloud)  │ ◀─────────────────── │ (this tool)  │
+   └────────────┘        PayResult               └──────────────────────────┘   result (POST)      └──────────────┘
+        caller                                          the broker                    the terminal
+```
+
+- **Your app** is the *caller* (a merchant/POS). It never talks to the emulator directly — it
+  only ever talks to the cloud.
+- **Staging** is the *broker*. It holds the pairing, and when your app asks for a payment it
+  pushes a command down to whichever terminal is paired, then waits for that terminal's result.
+- **The emulator** is the *terminal*. It connects **out** to staging (nothing listens on your
+  machine — no ports, no inbound), waits for commands over a long-lived SSE stream, runs its
+  outcome engine, and posts the result back.
+
+So a `pay()` in your app becomes: app → cloud → **SSE** → emulator → outcome → **POST** → cloud
+→ app. The emulator is standing in for a real card terminal in that loop.
+
+### Step 1 — start the emulator
+
 ```bash
 python3 omni_emulator.py --no-lan --relay
 ```
 
-No credentials, no dashboard step. The emulator connects to real
-`staging-api.aslanpay.ma` as a **shared demo terminal** and is ready in seconds.
+- `--relay` turns on the cloud half and (with no `BASE` argument) points it at
+  `https://staging-api.aslanpay.ma`.
+- `--no-lan` turns **off** the LAN half — you don't need the UDP/HTTP terminal for a
+  cloud-only run, so this keeps it quiet and avoids binding local ports.
 
-1. With no `--device-token` and no cache, the emulator fetches the shared demo terminal's
-   token from the public endpoint and connects:
-   ```
-   [Cloud] using shared demo terminal (Emulator E2E Merchant) — token cached.
-   [Cloud] SSE connected.
-   ```
-2. It prints a **pairing code**:
-   ```
-   [Cloud] pairing code: A1B2C3D4  (enter via pairCloud)
-   ```
-3. Your app calls `pairCloud({ pairingCode })` against real staging to obtain its own apiKey
-   (the emulator isn't involved in that leg).
-4. `pay` runs through the real staging cloud loop — command pushed to the emulator, outcome
-   posted back:
-   ```
-   pay({ amountCents: 1000 })   → approved
-   pay({ amountCents: 1005 })   → declined
-   ```
+You'll see it acquire a token and connect, all on its own:
 
-> The demo terminal is shared and read-only-ish: everyone who runs the emulator against
-> staging drives the same demo device. That's fine for integration testing — nothing you do
-> touches a real merchant. To use your **own** provisioned terminal instead, pass
-> `--device-token` (see [Device token](#device-token--re-onboarding)).
+```
+[Cloud] using shared demo terminal (Emulator E2E Merchant) — token cached.
+[Cloud] SSE connected.
+[Cloud] pairing code: A1B2C3D4  (enter via pairCloud)
+Emulator ready (mode=approve). Ctrl-C to stop.
+```
+
+**What just happened, line by line:**
+
+1. `using shared demo terminal …` — with no `--device-token` and no cache, the emulator
+   fetched a **shared demo device token** from the public endpoint
+   `GET /devices/demo-token`. This is why there's no setup: staging hands out a ready-made
+   demo terminal identity. (See [How zero-setup works](#how-zero-setup-works) below.)
+2. `SSE connected.` — it opened the long-lived `GET /cloud/stream` connection (OMNI-TOKEN
+   signed) and is now registered as an online terminal. Staging can push commands to it.
+3. `pairing code: A1B2C3D4` — the terminal asked staging for a one-time pairing code (via
+   `POST /cloud/pair/initiate`) and printed it. **Copy this code** — your app needs it next.
+
+### Step 2 — pair your app to that terminal
+
+Your app calls `pairCloud` with the code the emulator printed. This is a call to **staging**,
+not to the emulator — staging looks up which terminal owns that code and issues your app an
+`apiKey` scoped to it:
+
+```ts
+import { OmniClient, MemoryTokenStore } from '@belkouche/omni-react-native';
+
+const omni = new OmniClient({
+  tokenStore: new MemoryTokenStore(),
+  cloudBaseUrl: 'https://staging-api.aslanpay.ma/omni',
+});
+
+// A1B2C3D4 = the code the emulator printed in Step 1
+const target = await omni.pairCloud({ pairingCode: 'A1B2C3D4' });
+// → { mode: 'cloud', deviceId: '…', merchantName: 'Emulator E2E Merchant', … }
+```
+
+`target` is now a handle you pass to every payment call. Your app and the emulator are linked
+through staging — but notice they still never touched each other directly.
+
+### Step 3 — take a payment (the full round-trip)
+
+```ts
+const result = await omni.pay(target, { ref: 'ORDER-1001', amountCents: 1000 });
+// → { status: 'approved', authNumber: '…', stan: '…', cardNumber: '516794******3315', … }
+```
+
+While that promise is pending, this is the loop that runs:
+
+```
+your app  pay(1000) ─▶ staging  ──PayCommand──▶ emulator  (outcome engine: 1000 → approved)
+your app  ◀─PayResult── staging  ◀──result POST── emulator
+```
+
+The emulator's console echoes its side:
+
+```
+[Cloud] PayCommand cmryv…qjvu → approved
+```
+
+### Step 4 — drive deterministic outcomes
+
+The **last two digits of `amountCents`** fix the outcome (see [magic amounts](#magic-amounts)),
+so you can script an entire test suite with nothing but amounts — no prompts, no config:
+
+```ts
+await omni.pay(target, { ref: 'A', amountCents: 1000 });  // …00 → approved
+await omni.pay(target, { ref: 'B', amountCents: 1005 });  // …05 → declined (RC 005)
+await omni.pay(target, { ref: 'C', amountCents: 1051 });  // …51 → timeout
+
+// reverse a prior approval, and list the merchant's paired terminals — all over cloud:
+await omni.reverse(target, { ref: 'V', originalRef: 'A', stan: result.stan });
+await omni.listPos(target);   // → [{ kind: 'cloud', connected: true, … }]
+```
+
+That's the complete cloud surface — pair, pay, reverse, listPos — exercised end-to-end against
+real staging, with the emulator playing the terminal.
+
+### How zero-setup works
+
+The magic in Step 1 is the shared **demo terminal**. Onboarding a real Omni device normally
+means a claim + dashboard activation to mint a device token — a deliberate, human step. That's
+too much friction just to try the SDK, so staging exposes one pre-provisioned demo device
+through an unauthenticated `GET /devices/demo-token`:
+
+- **Nothing secret lives in this repo.** The token is fetched at runtime, then cached to the
+  local token file so subsequent runs skip the fetch.
+- **The blast radius is exactly one demo terminal.** Everyone running the emulator against
+  staging drives the *same* demo device. Nothing you do touches a real merchant, and the token
+  can't provision or reach anything else.
+- **It's a shared sandbox, not private.** If two people run the emulator at once, both are that
+  one demo terminal. Fine for integration testing; not a substitute for your own device.
+
+> **Want your own terminal instead?** Pass `--device-token <T>` (or set `OMNI_DEVICE_TOKEN`) to
+> use a device you provisioned yourself, or run the full claim flow. See
+> [Device token & re-onboarding](#device-token--re-onboarding).
+
+> **Endpoint disabled?** If staging has no demo device configured, `GET /devices/demo-token`
+> returns `404` and the emulator quietly falls through to the claim flow — it won't crash, it
+> just can't auto-onboard.
 
 ---
 
