@@ -225,5 +225,10 @@ class CloudTokenTests(unittest.TestCase):
         self.assertEqual(r, {"status": "reversed", "responseCode": "000", "stan": "2"})
 
 
+class SelfcheckTests(unittest.TestCase):
+    def test_selfcheck_passes(self):
+        self.assertTrue(e.run_selfcheck())
+
+
 if __name__ == "__main__":
     unittest.main()

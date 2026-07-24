@@ -359,10 +359,6 @@ def run_udp_discovery(host: str, port: int, ctx: EmulatorContext, stop: threadin
     sock.close()
 
 
-def ask_operator(ref: str, amount_centimes: int, error_code: str) -> dict:
-    return decide_outcome(amount_centimes, "approve", error_code)  # replaced in Task 7
-
-
 # ── Cloud: token persistence ────────────────────────────────────────────────
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.aslan-omni-emulator/device.json")
 
@@ -526,3 +522,126 @@ def _handle_cloud_event(base: str, ctx: EmulatorContext, device_token: str,
             pass
     elif event == "PairingRevoked":
         print("[Cloud] pairing revoked by server")
+
+
+# ── Interactive operator prompt ─────────────────────────────────────────────
+_stdin_q: "queue.Queue[str]" = queue.Queue()
+_stdin_started = False
+
+
+def _start_stdin_reader() -> None:
+    global _stdin_started
+    if _stdin_started:
+        return
+    _stdin_started = True
+
+    def _reader():
+        while True:
+            try:
+                _stdin_q.put(input().strip().lower())
+            except EOFError:
+                _stdin_q.put("a")
+                return
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+_ask_lock = threading.Lock()
+
+
+def ask_operator(ref: str, amount_centimes: int, error_code: str) -> dict:
+    """Prompt to approve or pick a decline scenario. Auto-approve after 120s."""
+    _start_stdin_reader()
+    scenarios = list(SCENARIOS.items())
+    with _ask_lock:
+        print(f"\n  ┌── Payment  ref={ref}  {amount_centimes/100:.2f} MAD ──")
+        print("  │  [a] Approve")
+        for i, (name, code) in enumerate(scenarios, 1):
+            print(f"  │  [{i:2d}] Decline — {name} ({code})")
+        print("  └── Choice → ", end="", flush=True)
+        try:
+            choice = _stdin_q.get(timeout=120)
+        except queue.Empty:
+            print("(timeout → approve)")
+            return decide_outcome(amount_centimes, "approve", error_code)
+    if choice in ("", "a"):
+        return decide_outcome(amount_centimes, "approve", error_code)
+    if choice.isdigit() and 1 <= int(choice) <= len(scenarios):
+        return {"status": "declined", "responseCode": scenarios[int(choice) - 1][1]}
+    return {"status": "declined", "responseCode": resolve_code(choice)}
+
+
+# ── Self-check ──────────────────────────────────────────────────────────────
+def run_selfcheck() -> bool:
+    store = PairingStore()
+    sid, pin = store.begin("SELF", "Self")
+    tok = store.confirm(sid, pin, "SELF", "Self")
+    token_id, secret_hex = tok["tokenId"], tok["tokenSecret"]
+    derived = hmac_hex(bytes.fromhex(secret_hex), token_id.encode())
+    ts = str(int(time.time()))
+    body = b'{"ref":"SC","amountCents":1000}'
+    sig = hmac_hex(bytes.fromhex(derived), f"{token_id}:{ts}:POST:/pay:{sha256_hex(body)}".encode())
+    ok, err = store.verify(token_id, ts, "POST", "/pay", body, sig)
+    print("selfcheck:", "OK" if ok else f"FAIL ({err})")
+    return ok
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+def main() -> None:
+    p = argparse.ArgumentParser(description="Aslan Omni terminal + cloud-device emulator")
+    p.add_argument("--lan-port", type=int, default=8080)
+    p.add_argument("--udp-port", type=int, default=8481)
+    p.add_argument("--no-lan", action="store_true")
+    p.add_argument("--serial", default=f"EMU-{socket.gethostname()}")
+    p.add_argument("--relay", nargs="?", const="https://staging-api.aslanpay.ma", default=None,
+                   help="Enable cloud half against BASE (default staging).")
+    p.add_argument("--device-token", default=os.environ.get("OMNI_DEVICE_TOKEN"))
+    p.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
+    p.add_argument("--save-token", action="store_true")
+    p.add_argument("--reset", action="store_true")
+    p.add_argument("--mode", default="approve",
+                   choices=["approve", "decline", "error", "interactive", "timeout"])
+    p.add_argument("--code", default="909")
+    p.add_argument("--selfcheck", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    if args.selfcheck:
+        sys.exit(0 if run_selfcheck() else 1)
+
+    if args.reset:
+        removed = reset_device_token(args.token_file)
+        print(f"[reset] {'deleted ' + args.token_file if removed else 'no cached token'}")
+        if not args.relay:
+            return
+
+    ctx = EmulatorContext(args.mode, args.code, serial=args.serial, debug=args.debug)
+    stop = threading.Event()
+    threads: list[threading.Thread] = []
+
+    if not args.no_lan:
+        httpd = make_lan_server("127.0.0.1", args.lan_port, ctx)
+        threads.append(threading.Thread(target=httpd.serve_forever, daemon=True))
+        threads.append(threading.Thread(target=run_udp_discovery,
+                                        args=("", args.udp_port, ctx, stop), daemon=True))
+        print(f"LAN terminal: http://127.0.0.1:{args.lan_port}  (discovery UDP :{args.udp_port})")
+
+    if args.relay:
+        rec = acquire_device_token(args.relay, args.token_file, args.device_token,
+                                   args.save_token, args.serial)
+        threads.append(threading.Thread(
+            target=run_cloud_relay, args=(args.relay, ctx, rec["deviceToken"], stop), daemon=True))
+        print(f"Cloud relay: {args.relay}")
+
+    for t in threads:
+        t.start()
+    print(f"Emulator ready (mode={args.mode}). Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop.set()
+        print("\nBye.")
+
+
+if __name__ == "__main__":
+    main()
