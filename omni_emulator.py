@@ -408,16 +408,48 @@ def reset_device_token(path: str) -> bool:
 
 
 # ── Cloud: HTTP with device signing ─────────────────────────────────────────
+# A browser-like User-Agent — Cloudflare (which fronts staging/prod) blocks the
+# default "Python-urllib/x.y" UA with a 403 (error 1010).
+USER_AGENT = "AslanOmniEmulator/1.0 (device)"
+
+
 def cloud_request(base: str, method: str, path: str, device_token: str,
                   body_obj: dict | None = None, stream: bool = False):
-    body = json.dumps(body_obj).encode() if body_obj is not None else b""
-    headers = {"Authorization": device_auth_header(device_token, method, path, body)}
+    # Serialize compactly (no spaces) so the bytes we sign match what the API
+    # hashes: it computes sha256(JSON.stringify(body)), and JS JSON.stringify emits
+    # no spaces. Python's default json.dumps adds ", "/": " spaces → signature
+    # mismatch (401 "Invalid signature") on any request with a JSON body.
+    body = json.dumps(body_obj, separators=(",", ":")).encode() if body_obj is not None else b""
+    headers = {
+        "Authorization": device_auth_header(device_token, method, path, body),
+        "User-Agent": USER_AGENT,
+    }
     if body:
         headers["Content-Type"] = "application/json"
     if stream:
         headers["Accept"] = "text/event-stream"
     req = urllib.request.Request(base + path, data=(body or None), method=method, headers=headers)
     return urllib.request.urlopen(req, timeout=None if stream else 30)
+
+
+# ── Cloud: SSE line streaming ───────────────────────────────────────────────
+def sse_lines(resp):
+    """Yield SSE lines from an HTTP response as they arrive.
+
+    urllib's buffered readline() does not deliver SSE lines in real time (it can
+    block waiting to fill its buffer), so we read raw chunks off the socket via
+    read1() and split on newlines ourselves. Each yielded item is one decoded
+    line with its trailing CR/LF stripped.
+    """
+    buf = b""
+    while True:
+        chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line.decode("utf-8", "replace").rstrip("\r")
 
 
 # ── Cloud: SSE parsing ──────────────────────────────────────────────────────
@@ -440,7 +472,10 @@ def parse_sse(lines):
 
 # ── Cloud: result payloads ──────────────────────────────────────────────────
 def result_payload_for_pay(outcome: dict) -> dict:
-    return {
+    # The API's resultSchema fields are z.string().optional() — NOT nullable — so
+    # posting explicit nulls (as a declined outcome would, having no auth/stan/card)
+    # fails validation with 400. Omit absent fields instead of sending null.
+    payload = {
         "status": outcome["status"],
         "responseCode": outcome.get("responseCode"),
         "authNumber": outcome.get("authNumber"),
@@ -451,6 +486,7 @@ def result_payload_for_pay(outcome: dict) -> dict:
         "txDate": outcome.get("transactionDate"),
         "txTime": outcome.get("transactionTime"),
     }
+    return {k: v for k, v in payload.items() if v is not None}
 
 
 def result_payload_for_reverse(stan: str) -> dict:
@@ -490,7 +526,9 @@ def acquire_device_token(base: str, token_file: str, explicit: str | None,
 def _cloud_json(base: str, method: str, path: str, body_obj: dict | None) -> dict:
     """Unauthenticated cloud call (claim/status are not device-authed)."""
     body = json.dumps(body_obj).encode() if body_obj is not None else None
-    headers = {"Content-Type": "application/json"} if body else {}
+    headers = {"User-Agent": USER_AGENT}
+    if body:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(base + path, data=body, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read() or b"{}")
@@ -507,11 +545,18 @@ def run_cloud_relay(base: str, ctx: EmulatorContext, device_token: str,
             resp = cloud_request(base, "GET", "/cloud/stream", device_token, stream=True)
             print("[Cloud] SSE connected.")
             backoff = 3
-            lines = (raw.decode("utf-8", "replace").rstrip("\n") for raw in resp)
-            for event, data in parse_sse(lines):
+            for event, data in parse_sse(sse_lines(resp)):
                 if stop.is_set():
                     break
-                _handle_cloud_event(base, ctx, device_token, event, data)
+                # Handle each command in its own thread so the SSE reader never
+                # blocks on the outbound result POST — it must keep consuming the
+                # stream (and acking Pings) to stay registered on the server, or
+                # the connection goes stale and later commands aren't delivered.
+                threading.Thread(
+                    target=_handle_cloud_event,
+                    args=(base, ctx, device_token, event, data),
+                    daemon=True,
+                ).start()
         except Exception as ex:  # noqa: BLE001
             print(f"[Cloud] disconnected: {ex}; retrying in {backoff}s")
             if stop.wait(backoff):
