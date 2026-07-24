@@ -506,6 +506,18 @@ def acquire_device_token(base: str, token_file: str, explicit: str | None,
     if cached:
         print(f"[Cloud] using cached device token from {token_file}")
         return cached
+    # No explicit or cached token: try the shared demo terminal. This lets a
+    # customer run the emulator against staging with zero setup. The endpoint is
+    # inert unless the server has a demo device configured (404 → fall through to
+    # the manual claim flow).
+    demo = fetch_demo_token(base)
+    if demo:
+        rec = {"deviceToken": demo["deviceToken"], "deviceId": None,
+               "merchantId": demo.get("merchantId"),
+               "merchantName": demo.get("merchantName"), "cloudBase": base}
+        save_device_token(token_file, rec)
+        print(f"[Cloud] using shared demo terminal ({demo.get('merchantName')}) — token cached.")
+        return rec
     print("[Cloud] no device token — starting claim…")
     resp = _cloud_json(base, "POST", "/devices/claim",
                        {"serial": serial, "model": "P3", "appVersion": "emulator"})
@@ -521,6 +533,22 @@ def acquire_device_token(base: str, token_file: str, explicit: str | None,
             save_device_token(token_file, rec)
             print("[Cloud] activated — token cached.")
             return rec
+
+
+def fetch_demo_token(base: str) -> dict | None:
+    """Fetch the shared demo terminal's device token from the public endpoint.
+    Returns None if the server has no demo device configured (404) or on error —
+    callers fall back to the manual claim flow."""
+    try:
+        return _cloud_json(base, "GET", "/devices/demo-token", None)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        print(f"[Cloud] demo-token fetch failed: HTTP {e.code}")
+        return None
+    except Exception as e:
+        print(f"[Cloud] demo-token fetch failed: {e}")
+        return None
 
 
 def _cloud_json(base: str, method: str, path: str, body_obj: dict | None) -> dict:
