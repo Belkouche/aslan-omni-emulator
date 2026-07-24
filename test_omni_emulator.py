@@ -192,5 +192,38 @@ class LanServerTests(unittest.TestCase):
         self.assertEqual(st, 401)
 
 
+import os
+import tempfile
+
+
+class CloudTokenTests(unittest.TestCase):
+    def test_token_file_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "device.json")
+            e.save_device_token(path, {"deviceToken": "omni_x", "deviceId": "d1",
+                                       "merchantId": "m", "merchantName": "M",
+                                       "cloudBase": "https://staging-api.aslanpay.ma"})
+            got = e.load_device_token(path, "https://staging-api.aslanpay.ma")
+            self.assertEqual(got["deviceToken"], "omni_x")
+            self.assertIsNone(e.load_device_token(path, "https://other"))
+            e.reset_device_token(path)
+            self.assertIsNone(e.load_device_token(path, "https://staging-api.aslanpay.ma"))
+
+    def test_parse_sse_frames(self):
+        raw = ("id: 1\nevent: PayCommand\ndata: {\"commandId\":\"c1\",\"ref\":\"R\",\"amountCents\":1000}\n\n"
+               "event: Ping\ndata: {}\n\n")
+        frames = list(e.parse_sse(iter(raw.splitlines())))
+        self.assertEqual(frames[0], ("PayCommand", {"commandId": "c1", "ref": "R", "amountCents": 1000}))
+        self.assertEqual(frames[1][0], "Ping")
+
+    def test_command_result_payload_for_pay_and_reverse(self):
+        pay_out = e.decide_outcome(1000, "approve", "909")
+        p = e.result_payload_for_pay(pay_out)
+        self.assertEqual(p["status"], "approved")
+        self.assertIn("txDate", p)  # cloud uses txDate/txTime keys
+        r = e.result_payload_for_reverse("2")
+        self.assertEqual(r, {"status": "reversed", "responseCode": "000", "stan": "2"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import queue
 import random
 import secrets
@@ -360,3 +361,168 @@ def run_udp_discovery(host: str, port: int, ctx: EmulatorContext, stop: threadin
 
 def ask_operator(ref: str, amount_centimes: int, error_code: str) -> dict:
     return decide_outcome(amount_centimes, "approve", error_code)  # replaced in Task 7
+
+
+# ── Cloud: token persistence ────────────────────────────────────────────────
+DEFAULT_TOKEN_FILE = os.path.expanduser("~/.aslan-omni-emulator/device.json")
+
+
+def save_device_token(path: str, rec: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+
+
+def load_device_token(path: str, cloud_base: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return rec if rec.get("cloudBase") == cloud_base else None
+
+
+def reset_device_token(path: str) -> bool:
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+# ── Cloud: HTTP with device signing ─────────────────────────────────────────
+def cloud_request(base: str, method: str, path: str, device_token: str,
+                  body_obj: dict | None = None, stream: bool = False):
+    body = json.dumps(body_obj).encode() if body_obj is not None else b""
+    headers = {"Authorization": device_auth_header(device_token, method, path, body)}
+    if body:
+        headers["Content-Type"] = "application/json"
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    req = urllib.request.Request(base + path, data=(body or None), method=method, headers=headers)
+    return urllib.request.urlopen(req, timeout=None if stream else 30)
+
+
+# ── Cloud: SSE parsing ──────────────────────────────────────────────────────
+def parse_sse(lines):
+    """Yield (event, data_obj) tuples from an iterator of decoded SSE lines."""
+    event, data = None, None
+    for line in lines:
+        if line == "":
+            if event is not None and data is not None:
+                try:
+                    yield event, json.loads(data)
+                except json.JSONDecodeError:
+                    pass
+            event, data = None, None
+        elif line.startswith("event:"):
+            event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data = line[len("data:"):].strip()
+
+
+# ── Cloud: result payloads ──────────────────────────────────────────────────
+def result_payload_for_pay(outcome: dict) -> dict:
+    return {
+        "status": outcome["status"],
+        "responseCode": outcome.get("responseCode"),
+        "authNumber": outcome.get("authNumber"),
+        "stan": outcome.get("stan"),
+        "rrn": outcome.get("rrn"),
+        "cardNumber": outcome.get("cardNumber"),
+        "cardScheme": outcome.get("cardScheme"),
+        "txDate": outcome.get("transactionDate"),
+        "txTime": outcome.get("transactionTime"),
+    }
+
+
+def result_payload_for_reverse(stan: str) -> dict:
+    return {"status": "reversed", "responseCode": "000", "stan": stan}
+
+
+# ── Cloud: claim + relay loop ───────────────────────────────────────────────
+def acquire_device_token(base: str, token_file: str, explicit: str | None,
+                         save: bool, serial: str) -> dict:
+    if explicit:
+        rec = {"deviceToken": explicit, "deviceId": None, "merchantId": None,
+               "merchantName": None, "cloudBase": base}
+        if save:
+            save_device_token(token_file, rec)
+        return rec
+    cached = load_device_token(token_file, base)
+    if cached:
+        print(f"[Cloud] using cached device token from {token_file}")
+        return cached
+    print("[Cloud] no device token — starting claim…")
+    resp = _cloud_json(base, "POST", "/devices/claim",
+                       {"serial": serial, "model": "P3", "appVersion": "emulator"})
+    uuid, claim_url = resp["uuid"], resp["claimUrl"]
+    print(f"[Cloud] Activate this device: {claim_url}\n[Cloud] waiting for activation…")
+    while True:
+        time.sleep(3)
+        status = _cloud_json(base, "GET", f"/devices/claim/{uuid}/status", None)
+        if status.get("status") == "activated" and status.get("deviceToken"):
+            rec = {"deviceToken": status["deviceToken"], "deviceId": None,
+                   "merchantId": status.get("merchantId"),
+                   "merchantName": status.get("merchantName"), "cloudBase": base}
+            save_device_token(token_file, rec)
+            print("[Cloud] activated — token cached.")
+            return rec
+
+
+def _cloud_json(base: str, method: str, path: str, body_obj: dict | None) -> dict:
+    """Unauthenticated cloud call (claim/status are not device-authed)."""
+    body = json.dumps(body_obj).encode() if body_obj is not None else None
+    headers = {"Content-Type": "application/json"} if body else {}
+    req = urllib.request.Request(base + path, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def run_cloud_relay(base: str, ctx: EmulatorContext, device_token: str,
+                    stop: threading.Event) -> None:
+    backoff = 3
+    while not stop.is_set():
+        try:
+            code = cloud_request(base, "POST", "/cloud/pair/initiate", device_token, {})
+            code_obj = json.loads(code.read())
+            print(f"[Cloud] pairing code: {code_obj.get('pairingCode')}  (enter via pairCloud)")
+            resp = cloud_request(base, "GET", "/cloud/stream", device_token, stream=True)
+            print("[Cloud] SSE connected.")
+            backoff = 3
+            lines = (raw.decode("utf-8", "replace").rstrip("\n") for raw in resp)
+            for event, data in parse_sse(lines):
+                if stop.is_set():
+                    break
+                _handle_cloud_event(base, ctx, device_token, event, data)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[Cloud] disconnected: {ex}; retrying in {backoff}s")
+            if stop.wait(backoff):
+                break
+            backoff = min(backoff * 2, 60)
+
+
+def _handle_cloud_event(base: str, ctx: EmulatorContext, device_token: str,
+                        event: str, data: dict) -> None:
+    if event == "PayCommand":
+        amount = int(data["amountCents"])
+        outcome = decide_outcome(amount, ctx.mode, ctx.error_code)
+        if ctx.mode == "interactive":
+            outcome = ask_operator(data.get("ref", ""), amount, ctx.error_code)
+        if outcome["status"] == "timeout":
+            print(f"[Cloud] PayCommand {data['commandId']} → timeout (not posting; long-poll expires)")
+            return
+        cloud_request(base, "POST", f"/cloud/pay/{data['commandId']}/result",
+                      device_token, result_payload_for_pay(outcome)).read()
+        print(f"[Cloud] PayCommand {data['commandId']} → {outcome['status']}")
+    elif event == "ReverseCommand":
+        cloud_request(base, "POST", f"/cloud/pay/{data['commandId']}/result",
+                      device_token, result_payload_for_reverse(data.get("stan", ""))).read()
+        print(f"[Cloud] ReverseCommand {data['commandId']} → reversed")
+    elif event == "Ping":
+        try:
+            cloud_request(base, "POST", "/cloud/ping", device_token, {}).read()
+        except Exception:  # noqa: BLE001
+            pass
+    elif event == "PairingRevoked":
+        print("[Cloud] pairing revoked by server")
