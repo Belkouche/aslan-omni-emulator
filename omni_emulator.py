@@ -226,3 +226,137 @@ class PairingStore:
     def revoke(self, token_id: str) -> bool:
         with self._lock:
             return self._tokens.pop(token_id, None) is not None
+# ── Shared context ──────────────────────────────────────────────────────────
+class EmulatorContext:
+    """Shared state + config across LAN and cloud halves."""
+
+    def __init__(self, mode: str, error_code: str, terminal_id: str = "EMU-TID",
+                 merchant_id: str = "EMU-MID", serial: str = "EMU-SERIAL",
+                 debug: bool = False) -> None:
+        self.mode = mode
+        self.error_code = error_code
+        self.terminal_id = terminal_id
+        self.merchant_id = merchant_id
+        self.serial = serial
+        self.debug = debug
+        self.pairing = PairingStore()
+        self.pairing.last_pin = None  # test hook: last PIN printed
+        self._paid_refs: dict[str, dict] = {}   # ref -> PayResult (idempotency)
+        self._lock = threading.Lock()
+
+    def resolve_payment(self, ref: str, amount_centimes: int) -> dict:
+        with self._lock:
+            if ref in self._paid_refs:
+                return self._paid_refs[ref]
+            outcome = decide_outcome(amount_centimes, self.mode, self.error_code)
+            if self.mode == "interactive":
+                outcome = ask_operator(ref, amount_centimes, self.error_code)
+            res = pay_result(ref, amount_centimes, outcome, self.terminal_id, self.merchant_id)
+            self._paid_refs[ref] = res
+            return res
+
+
+# ── LAN HTTP server ─────────────────────────────────────────────────────────
+def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            if ctx.debug:
+                super().log_message(*a)
+
+        def _send(self, code: int, obj: dict | None):
+            payload = json.dumps(obj).encode() if obj is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if payload:
+                self.wfile.write(payload)
+
+        def _read_body(self) -> bytes:
+            n = int(self.headers.get("Content-Length", 0))
+            return self.rfile.read(n) if n else b""
+
+        def _auth(self, body: bytes) -> tuple[str | None, str | None]:
+            h = self.headers.get("Authorization", "")
+            if not h.startswith("OMNI-TOKEN "):
+                return None, "missing Authorization"
+            parts = dict(p.split("=", 1) for p in h[len("OMNI-TOKEN "):].split(","))
+            ok, err = ctx.pairing.verify(parts.get("tokenId", ""), parts.get("ts", ""),
+                                         self.command, self.path, body, parts.get("sig", ""))
+            return (parts["tokenId"], None) if ok else (None, err)
+
+        def do_GET(self):
+            if self.path == "/health":
+                return self._send(200, {"status": "ok", "version": "1.0.12", "napsPay": "installed"})
+            if self.path == "/admin/pos":
+                _, err = self._auth(b"")
+                if err:
+                    return self._send(401, {"error": err})
+                return self._send(200, {"pos": ctx.pairing.list_pos()})
+            self._send(404, {"error": "not found"})
+
+        def do_DELETE(self):
+            if self.path.startswith("/admin/pos/"):
+                _, err = self._auth(b"")
+                if err:
+                    return self._send(401, {"error": err})
+                token_id = self.path.rsplit("/", 1)[-1]
+                ctx.pairing.revoke(token_id)
+                return self._send(204, None)
+            self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            body = self._read_body()
+            if self.path == "/pair/request":
+                req = json.loads(body or b"{}")
+                sid, pin = ctx.pairing.begin(req.get("posId", ""), req.get("posLabel", ""))
+                ctx.pairing.last_pin = pin
+                print(f"[LAN pair] PIN for '{req.get('posLabel','')}': {pin}  (type this into your app)")
+                return self._send(200, {"sessionId": sid, "expiresIn": SESSION_TTL_SEC})
+            if self.path == "/pair/confirm":
+                req = json.loads(body or b"{}")
+                try:
+                    tok = ctx.pairing.confirm(req["sessionId"], req["pin"],
+                                              req.get("posId", ""), req.get("posLabel", ""))
+                    return self._send(200, tok)
+                except (PairError, KeyError) as ex:
+                    return self._send(400, {"error": str(ex) or "invalid or expired session"})
+            if self.path in ("/pay", "/reversal"):
+                _, err = self._auth(body)
+                if err:
+                    return self._send(401, {"error": err})
+                req = json.loads(body or b"{}")
+                if self.path == "/reversal":
+                    return self._send(200, {
+                        "status": "reversed", "ref": req.get("ref"),
+                        "responseCode": "000", "stan": req.get("stan"),
+                    })
+                res = ctx.resolve_payment(req["ref"], int(req["amountCents"]))
+                return self._send(200, res)
+            self._send(404, {"error": "not found"})
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+# ── UDP discovery ───────────────────────────────────────────────────────────
+def run_udp_discovery(host: str, port: int, ctx: EmulatorContext, stop: threading.Event) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.settimeout(0.5)
+    reply = json.dumps({"device": ctx.serial, "model": "P3",
+                        "version": "1.0.12", "hmac": "emulated"}).encode()
+    while not stop.is_set():
+        try:
+            data, addr = sock.recvfrom(1024)
+        except socket.timeout:
+            continue
+        if data.startswith(b"OMNI-DISC:"):
+            sock.sendto(reply, addr)
+    sock.close()
+
+
+def ask_operator(ref: str, amount_centimes: int, error_code: str) -> dict:
+    return decide_outcome(amount_centimes, "approve", error_code)  # replaced in Task 7

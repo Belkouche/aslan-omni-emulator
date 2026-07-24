@@ -1,3 +1,4 @@
+import json
 import unittest
 import omni_emulator as e
 
@@ -125,6 +126,70 @@ class PairingTests(unittest.TestCase):
         self.assertIn("createdAt", rows[0])
         self.assertTrue(store.revoke(tok["tokenId"]))
         self.assertEqual(store.list_pos(), [])
+
+
+import threading as _t
+import urllib.error
+import urllib.request as _u
+
+_u.error = urllib.error  # provided block references _u.error.HTTPError
+
+
+class LanServerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx = e.EmulatorContext(mode="approve", error_code="909")
+        cls.httpd = e.make_lan_server("127.0.0.1", 0, cls.ctx)  # port 0 = ephemeral
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = _t.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+
+    def _base(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def _post(self, path, body_obj, headers=None):
+        data = json.dumps(body_obj).encode()
+        req = _u.Request(self._base() + path, data=data, method="POST",
+                         headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with _u.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except _u.error.HTTPError as ex:
+            return ex.code, json.loads(ex.read() or b"{}")
+
+    def test_health(self):
+        with _u.urlopen(self._base() + "/health") as r:
+            body = json.loads(r.read())
+        self.assertEqual(body["status"], "ok")
+
+    def test_full_pair_and_pay(self):
+        st, resp = self._post("/pair/request", {"posId": "T", "posLabel": "L"})
+        self.assertEqual(st, 200)
+        session_id = resp["sessionId"]
+        pin = self.ctx.pairing.last_pin  # emulator exposes last printed PIN for tests
+        st, tok = self._post("/pair/confirm",
+                             {"sessionId": session_id, "pin": pin, "posId": "T", "posLabel": "L"})
+        self.assertEqual(st, 200)
+        token_id, secret_hex = tok["tokenId"], tok["tokenSecret"]
+
+        body = json.dumps({"ref": "R1", "amountCents": 1000}).encode()
+        derived = e.hmac_hex(bytes.fromhex(secret_hex), token_id.encode())
+        ts = str(int(e.time.time()))
+        sig = e.hmac_hex(bytes.fromhex(derived),
+                         f"{token_id}:{ts}:POST:/pay:{e.sha256_hex(body)}".encode())
+        auth = f"OMNI-TOKEN tokenId={token_id},ts={ts},sig={sig}"
+        st, res = self._post("/pay", {"ref": "R1", "amountCents": 1000}, {"Authorization": auth})
+        self.assertEqual(st, 200)
+        self.assertEqual(res["status"], "approved")
+        self.assertEqual(res["ref"], "R1")
+
+    def test_pay_rejects_unsigned(self):
+        st, res = self._post("/pay", {"ref": "R2", "amountCents": 1000})
+        self.assertEqual(st, 401)
 
 
 if __name__ == "__main__":
