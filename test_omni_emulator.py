@@ -77,5 +77,55 @@ class OutcomeTests(unittest.TestCase):
         self.assertIn("transactionDate", r)
 
 
+class PairingTests(unittest.TestCase):
+    def test_pair_request_then_confirm_issues_token(self):
+        store = e.PairingStore()
+        session_id, pin = store.begin("TILL-01", "Caisse 1")
+        self.assertRegex(pin, r"^\d{6}$")
+        tok = store.confirm(session_id, pin, "TILL-01", "Caisse 1")
+        self.assertIn("tokenId", tok)
+        self.assertRegex(tok["tokenSecret"], r"^[0-9a-f]{64}$")
+        self.assertEqual(tok["terminalModel"], "P3")
+
+    def test_confirm_wrong_pin(self):
+        store = e.PairingStore()
+        session_id, _pin = store.begin("T", "L")
+        with self.assertRaises(e.PairError):
+            store.confirm(session_id, "000000", "T", "L")
+
+    def test_verify_signed_request_accepts_client_sig(self):
+        store = e.PairingStore()
+        sid, pin = store.begin("T", "L")
+        tok = store.confirm(sid, pin, "T", "L")
+        token_id, secret_hex = tok["tokenId"], tok["tokenSecret"]
+        derived = e.hmac_hex(bytes.fromhex(secret_hex), token_id.encode())
+        ts = str(int(e.time.time()))
+        body = b'{"ref":"R1","amountCents":1000}'
+        sig = e.hmac_hex(bytes.fromhex(derived), f"{token_id}:{ts}:POST:/pay:{e.sha256_hex(body)}".encode())
+        ok, err = store.verify(token_id, ts, "POST", "/pay", body, sig)
+        self.assertTrue(ok, err)
+
+    def test_verify_rejects_bad_sig_and_skew(self):
+        store = e.PairingStore()
+        sid, pin = store.begin("T", "L")
+        tok = store.confirm(sid, pin, "T", "L")
+        ts = str(int(e.time.time()))
+        ok, err = store.verify(tok["tokenId"], ts, "POST", "/pay", b"{}", "deadbeef")
+        self.assertFalse(ok)
+        old = str(int(e.time.time()) - 999)
+        ok2, _ = store.verify(tok["tokenId"], old, "POST", "/pay", b"{}", "x")
+        self.assertFalse(ok2)
+
+    def test_list_and_revoke(self):
+        store = e.PairingStore()
+        sid, pin = store.begin("TILL-9", "Caisse 9")
+        tok = store.confirm(sid, pin, "TILL-9", "Caisse 9")
+        rows = store.list_pos()
+        self.assertEqual(rows[0]["posId"], "TILL-9")
+        self.assertIn("createdAt", rows[0])
+        self.assertTrue(store.revoke(tok["tokenId"]))
+        self.assertEqual(store.list_pos(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

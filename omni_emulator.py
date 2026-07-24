@@ -150,3 +150,79 @@ def pay_result(ref: str, amount_centimes: int, outcome: dict,
         "transactionTime": outcome.get("transactionTime"),
         "amountCents": amount_centimes,
     }
+
+
+# ── Pairing store (LAN) ─────────────────────────────────────────────────────
+TS_TOLERANCE_SEC = 30
+SESSION_TTL_SEC = 300
+
+
+class PairError(Exception):
+    pass
+
+
+class PairingStore:
+    """In-memory pairing sessions + issued POS tokens for the LAN terminal."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, dict] = {}
+        self._tokens: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def begin(self, pos_id: str, pos_label: str) -> tuple[str, str]:
+        session_id = secrets.token_hex(16)
+        pin = f"{random.randint(0, 999999):06d}"
+        with self._lock:
+            self._sessions[session_id] = {
+                "pinHash": sha256_hex(pin.encode()),
+                "posId": pos_id, "posLabel": pos_label,
+                "exp": time.time() + SESSION_TTL_SEC,
+            }
+        return session_id, pin
+
+    def confirm(self, session_id: str, pin: str, pos_id: str, pos_label: str) -> dict:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s or s["exp"] < time.time():
+                raise PairError("invalid or expired session")
+            if not hmac.compare_digest(s["pinHash"], sha256_hex(pin.encode())):
+                raise PairError("wrong pin")
+            del self._sessions[session_id]
+            token_secret = secrets.token_bytes(32)
+            token_id = secrets.token_hex(16)
+            token_hmac = hmac_hex(token_secret, token_id.encode())
+            self._tokens[token_id] = {
+                "tokenHmac": token_hmac, "posId": pos_id, "posLabel": pos_label,
+                "createdAt": datetime.now().isoformat(),
+            }
+        return {
+            "tokenId": token_id, "tokenSecret": token_secret.hex(),
+            "posId": pos_id, "terminalModel": "P3",
+        }
+
+    def verify(self, token_id: str, ts: str, method: str, path: str,
+               body: bytes, sig: str) -> tuple[bool, str | None]:
+        try:
+            if abs(int(time.time()) - int(ts)) > TS_TOLERANCE_SEC:
+                return False, "timestamp out of window"
+        except ValueError:
+            return False, "bad timestamp"
+        tok = self._tokens.get(token_id)
+        if not tok:
+            return False, "unknown token"
+        expected = lan_expected_sig(tok["tokenHmac"], token_id, ts, method, path, body)
+        if not hmac.compare_digest(expected, sig):
+            return False, "invalid signature"
+        return True, None
+
+    def list_pos(self) -> list[dict]:
+        with self._lock:
+            return [
+                {"tokenId": tid, "posId": t["posId"], "posLabel": t["posLabel"],
+                 "createdAt": t["createdAt"]}
+                for tid, t in self._tokens.items()
+            ]
+
+    def revoke(self, token_id: str) -> bool:
+        with self._lock:
+            return self._tokens.pop(token_id, None) is not None
