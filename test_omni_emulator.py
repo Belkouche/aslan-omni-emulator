@@ -230,5 +230,44 @@ class SelfcheckTests(unittest.TestCase):
         self.assertTrue(e.run_selfcheck())
 
 
+class RobustnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ctx = e.EmulatorContext(mode="approve", error_code="909")
+        cls.httpd = e.make_lan_server("127.0.0.1", 0, cls.ctx)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = _t.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _raw_post(self, path, data_bytes, headers=None):
+        req = _u.Request(f"http://127.0.0.1:{self.port}{path}", data=data_bytes,
+                         method="POST", headers=headers or {})
+        try:
+            with _u.urlopen(req) as r:
+                return r.status, r.read()
+        except _u.error.HTTPError as ex:
+            return ex.code, ex.read()
+
+    def test_malformed_auth_returns_401_not_crash(self):
+        st, _ = self._raw_post("/pay", b'{"ref":"R","amountCents":1000}',
+                               {"Authorization": "OMNI-TOKEN garbage"})
+        self.assertEqual(st, 401)
+
+    def test_invalid_json_returns_400_not_crash(self):
+        st, _ = self._raw_post("/pair/request", b"{not json")
+        self.assertEqual(st, 400)
+
+    def test_magic_overrides_interactive_no_prompt(self):
+        # interactive mode but a magic-timeout amount must NOT prompt — resolves directly.
+        ctx = e.EmulatorContext(mode="interactive", error_code="909")
+        res = ctx.resolve_payment("RX", 1051)  # ..51 → timeout
+        self.assertEqual(res["status"], "timeout")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -249,10 +249,16 @@ class EmulatorContext:
         with self._lock:
             if ref in self._paid_refs:
                 return self._paid_refs[ref]
+        # compute outcome outside the lock (interactive prompt may block)
+        if self.mode == "interactive" and magic_outcome(amount_centimes) is None:
+            outcome = ask_operator(ref, amount_centimes, self.error_code)
+        else:
             outcome = decide_outcome(amount_centimes, self.mode, self.error_code)
-            if self.mode == "interactive":
-                outcome = ask_operator(ref, amount_centimes, self.error_code)
-            res = pay_result(ref, amount_centimes, outcome, self.terminal_id, self.merchant_id)
+        res = pay_result(ref, amount_centimes, outcome, self.terminal_id, self.merchant_id)
+        with self._lock:
+            # another thread may have resolved the same ref while we prompted
+            if ref in self._paid_refs:
+                return self._paid_refs[ref]
             self._paid_refs[ref] = res
             return res
 
@@ -283,10 +289,19 @@ def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTP
             h = self.headers.get("Authorization", "")
             if not h.startswith("OMNI-TOKEN "):
                 return None, "missing Authorization"
-            parts = dict(p.split("=", 1) for p in h[len("OMNI-TOKEN "):].split(","))
+            try:
+                parts = dict(p.split("=", 1) for p in h[len("OMNI-TOKEN "):].split(","))
+            except ValueError:
+                return None, "malformed Authorization"
             ok, err = ctx.pairing.verify(parts.get("tokenId", ""), parts.get("ts", ""),
                                          self.command, self.path, body, parts.get("sig", ""))
             return (parts["tokenId"], None) if ok else (None, err)
+
+        def _json_body(self, body: bytes):
+            try:
+                return json.loads(body or b"{}"), None
+            except (json.JSONDecodeError, ValueError):
+                return None, "invalid JSON"
 
         def do_GET(self):
             if self.path == "/health":
@@ -311,13 +326,17 @@ def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTP
         def do_POST(self):
             body = self._read_body()
             if self.path == "/pair/request":
-                req = json.loads(body or b"{}")
+                req, jerr = self._json_body(body)
+                if jerr:
+                    return self._send(400, {"error": jerr})
                 sid, pin = ctx.pairing.begin(req.get("posId", ""), req.get("posLabel", ""))
                 ctx.pairing.last_pin = pin
                 print(f"[LAN pair] PIN for '{req.get('posLabel','')}': {pin}  (type this into your app)")
                 return self._send(200, {"sessionId": sid, "expiresIn": SESSION_TTL_SEC})
             if self.path == "/pair/confirm":
-                req = json.loads(body or b"{}")
+                req, jerr = self._json_body(body)
+                if jerr:
+                    return self._send(400, {"error": jerr})
                 try:
                     tok = ctx.pairing.confirm(req["sessionId"], req["pin"],
                                               req.get("posId", ""), req.get("posLabel", ""))
@@ -328,7 +347,9 @@ def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTP
                 _, err = self._auth(body)
                 if err:
                     return self._send(401, {"error": err})
-                req = json.loads(body or b"{}")
+                req, jerr = self._json_body(body)
+                if jerr:
+                    return self._send(400, {"error": jerr})
                 if self.path == "/reversal":
                     return self._send(200, {
                         "status": "reversed", "ref": req.get("ref"),
@@ -502,9 +523,10 @@ def _handle_cloud_event(base: str, ctx: EmulatorContext, device_token: str,
                         event: str, data: dict) -> None:
     if event == "PayCommand":
         amount = int(data["amountCents"])
-        outcome = decide_outcome(amount, ctx.mode, ctx.error_code)
-        if ctx.mode == "interactive":
+        if ctx.mode == "interactive" and magic_outcome(amount) is None:
             outcome = ask_operator(data.get("ref", ""), amount, ctx.error_code)
+        else:
+            outcome = decide_outcome(amount, ctx.mode, ctx.error_code)
         if outcome["status"] == "timeout":
             print(f"[Cloud] PayCommand {data['commandId']} → timeout (not posting; long-poll expires)")
             return
