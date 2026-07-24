@@ -52,3 +52,38 @@ def magic_outcome(amount_centimes: int) -> str | None:
     if suffix in (0, 5, 8):
         return _MAGIC[suffix]
     return None
+
+
+# ── HMAC / hashing ──────────────────────────────────────────────────────────
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def hmac_hex(key: bytes, data: bytes) -> str:
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+def lan_expected_sig(token_hmac_hex: str, token_id: str, ts: str,
+                     method: str, path: str, body: bytes) -> str:
+    """The signature the emulator expects for an inbound LAN request.
+
+    Derived-key scheme: key = hexToBytes(tokenHmac); tokenHmac was HMAC(secret, tokenId).
+    """
+    key = bytes.fromhex(token_hmac_hex)
+    msg = f"{token_id}:{ts}:{method}:{path}:{sha256_hex(body)}"
+    return hmac_hex(key, msg.encode())
+
+
+def device_sig(device_token: str, ts: str, method: str, path: str, body: bytes) -> str:
+    """The signature the emulator SENDS as a cloud device.
+
+    Raw-key scheme: key = deviceToken utf-8; message includes the token as tokenId.
+    """
+    msg = f"{device_token}:{ts}:{method}:{path}:{sha256_hex(body)}"
+    return hmac_hex(device_token.encode(), msg.encode())
+
+
+def device_auth_header(device_token: str, method: str, path: str, body: bytes) -> str:
+    ts = str(int(time.time()))
+    sig = device_sig(device_token, ts, method, path, body)
+    return f"OMNI-TOKEN tokenId={device_token},ts={ts},sig={sig}"
