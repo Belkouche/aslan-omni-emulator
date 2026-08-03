@@ -27,7 +27,11 @@ omni_emulator.py
 
 - **LAN mode** (default): point the SDK's LAN transport at `127.0.0.1`. The emulator is a
   fully self-contained fake terminal — UDP discovery + HTTP API with OMNI-TOKEN auth — so
-  you can do the full discover → pair → pay → reverse flow offline.
+  you can do the full discover → pair → pay → reverse flow offline. Like the real terminal,
+  it supports **encrypted pairing**: if the SDK sends an ephemeral RSA `clientPubKey` in
+  `/pair/request`, `/pair/confirm` returns `encryptedTokenSecret` (RSA-OAEP-SHA256) instead
+  of a cleartext `tokenSecret` — so it faithfully exercises the SDK's v1.1.0 path. Legacy
+  SDKs (no key) still get the cleartext secret.
 - **Cloud mode** (`--relay`): the emulator connects **out** to real
   `staging-api.aslanpay.ma` as a provisioned *device*. Your app hits real staging cloud;
   the emulator executes the payment commands staging pushes to it.
