@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Aslan Omni terminal + cloud-device emulator (stdlib only)."""
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -62,6 +63,69 @@ def sha256_hex(data: bytes) -> str:
 
 def hmac_hex(key: bytes, data: bytes) -> str:
     return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+# ── RSA-OAEP-SHA256 (stdlib only — mirrors the terminal's #4b encryption) ────
+# The real terminal returns the pairing tokenSecret encrypted to the POS's
+# ephemeral RSA public key so it never crosses the LAN in cleartext. Python's
+# stdlib has no RSA, so we implement just the encrypt side (SPKI parse + OAEP
+# pad + modular exponentiation). Must match RSA/ECB/OAEPWithSHA-256AndMGF1Padding
+# so the SDK (WebCrypto / .NET RSA-OAEP-SHA256) can decrypt.
+
+def _der_len(data: bytes, i: int) -> tuple[int, int]:
+    """Read a DER length at offset i; return (length, next_offset)."""
+    b = data[i]; i += 1
+    if b < 0x80:
+        return b, i
+    n = b & 0x7F
+    length = int.from_bytes(data[i:i + n], "big")
+    return length, i + n
+
+
+def _parse_spki_rsa(spki: bytes) -> tuple[int, int]:
+    """Extract (modulus n, public exponent e) from an SPKI/DER RSA public key."""
+    # SPKI: SEQ { SEQ { OID rsaEncryption, NULL }, BIT STRING { RSAPublicKey } }
+    i = 0
+    assert spki[i] == 0x30; _, i = _der_len(spki, i + 1)      # outer SEQUENCE
+    assert spki[i] == 0x30; alg_len, j = _der_len(spki, i + 1)  # AlgorithmIdentifier
+    i = j + alg_len                                            # skip algorithm
+    assert spki[i] == 0x03; bit_len, i = _der_len(spki, i + 1)  # BIT STRING
+    assert spki[i] == 0x00; i += 1                             # unused-bits byte
+    assert spki[i] == 0x30; _, i = _der_len(spki, i + 1)      # RSAPublicKey SEQUENCE
+    assert spki[i] == 0x02; n_len, i = _der_len(spki, i + 1)  # INTEGER modulus
+    n = int.from_bytes(spki[i:i + n_len], "big"); i += n_len
+    assert spki[i] == 0x02; e_len, i = _der_len(spki, i + 1)  # INTEGER exponent
+    e = int.from_bytes(spki[i:i + e_len], "big")
+    return n, e
+
+
+def _mgf1_sha256(seed: bytes, length: int) -> bytes:
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return out[:length]
+
+
+def rsa_oaep_encrypt_b64(spki_b64: str, message: bytes) -> str:
+    """RSA-OAEP-SHA256 encrypt `message` to the SPKI public key; return base64."""
+    n, e = _parse_spki_rsa(base64.b64decode(spki_b64))
+    k = (n.bit_length() + 7) // 8           # modulus size in bytes
+    h_len = 32                              # SHA-256
+    if len(message) > k - 2 * h_len - 2:
+        raise ValueError("message too long for RSA-OAEP")
+    l_hash = hashlib.sha256(b"").digest()   # empty label
+    ps = b"\x00" * (k - len(message) - 2 * h_len - 2)
+    db = l_hash + ps + b"\x01" + message
+    seed = secrets.token_bytes(h_len)
+    db_mask = _mgf1_sha256(seed, k - h_len - 1)
+    masked_db = bytes(a ^ b for a, b in zip(db, db_mask))
+    seed_mask = _mgf1_sha256(masked_db, h_len)
+    masked_seed = bytes(a ^ b for a, b in zip(seed, seed_mask))
+    em = b"\x00" + masked_seed + masked_db
+    c = pow(int.from_bytes(em, "big"), e, n)
+    return base64.b64encode(c.to_bytes(k, "big")).decode()
 
 
 def lan_expected_sig(token_hmac_hex: str, token_id: str, ts: str,
@@ -170,13 +234,14 @@ class PairingStore:
         self._tokens: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def begin(self, pos_id: str, pos_label: str) -> tuple[str, str]:
+    def begin(self, pos_id: str, pos_label: str, client_pub_key: str | None = None) -> tuple[str, str]:
         session_id = secrets.token_hex(16)
         pin = f"{random.randint(0, 999999):06d}"
         with self._lock:
             self._sessions[session_id] = {
                 "pinHash": sha256_hex(pin.encode()),
                 "posId": pos_id, "posLabel": pos_label,
+                "clientPubKey": client_pub_key,
                 "exp": time.time() + SESSION_TTL_SEC,
             }
         return session_id, pin
@@ -189,6 +254,7 @@ class PairingStore:
             if not hmac.compare_digest(s["pinHash"], sha256_hex(pin.encode())):
                 raise PairError("wrong pin")
             del self._sessions[session_id]
+            client_pub_key = s.get("clientPubKey")
             token_secret = secrets.token_bytes(32)
             token_id = secrets.token_hex(16)
             token_hmac = hmac_hex(token_secret, token_id.encode())
@@ -196,10 +262,14 @@ class PairingStore:
                 "tokenHmac": token_hmac, "posId": pos_id, "posLabel": pos_label,
                 "createdAt": datetime.now().isoformat(),
             }
-        return {
-            "tokenId": token_id, "tokenSecret": token_secret.hex(),
-            "posId": pos_id, "terminalModel": "P3",
-        }
+        resp = {"tokenId": token_id, "posId": pos_id, "terminalModel": "P3"}
+        # #4b: if the POS sent an ephemeral RSA key, return the secret encrypted
+        # (never cleartext) — mirrors the real terminal. Legacy POS → cleartext.
+        if client_pub_key:
+            resp["encryptedTokenSecret"] = rsa_oaep_encrypt_b64(client_pub_key, token_secret)
+        else:
+            resp["tokenSecret"] = token_secret.hex()
+        return resp
 
     def verify(self, token_id: str, ts: str, method: str, path: str,
                body: bytes, sig: str) -> tuple[bool, str | None]:
@@ -329,7 +399,9 @@ def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTP
                 req, jerr = self._json_body(body)
                 if jerr:
                     return self._send(400, {"error": jerr})
-                sid, pin = ctx.pairing.begin(req.get("posId", ""), req.get("posLabel", ""))
+                sid, pin = ctx.pairing.begin(
+                    req.get("posId", ""), req.get("posLabel", ""), req.get("clientPubKey"),
+                )
                 ctx.pairing.last_pin = pin
                 print(f"[LAN pair] PIN for '{req.get('posLabel','')}': {pin}  (type this into your app)")
                 return self._send(200, {"sessionId": sid, "expiresIn": SESSION_TTL_SEC})
