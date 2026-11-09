@@ -241,6 +241,24 @@ def long_field(req: dict, name: str) -> int:
     return v
 
 
+def parse_long(text: str | None) -> int | None:
+    """Kotlin String.toLongOrNull(): optional sign, ASCII digits, signed 64-bit range."""
+    if text is None or not re.fullmatch(r"[+-]?[0-9]+", text):
+        return None
+    value = int(text)
+    return value if -(2 ** 63) <= value < 2 ** 63 else None
+
+
+def bool_field(req: dict, name: str) -> bool | None:
+    """Read a Boolean DTO field the way Gson does: booleans, any string (parseBoolean) or null."""
+    v = req.get(name)
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() == "true"
+    raise ValueError(f"{name} is not a boolean")
+
+
 def write_private(path: str, text: str) -> None:
     """Atomically write a secret-bearing file: dir 0o700 (when created), file 0o600."""
     directory = os.path.dirname(os.path.abspath(path))
@@ -757,18 +775,19 @@ class LanApi:
         token_id = parts.get("tokenId")
         if token_id is None:
             return None, err(401, "missing tokenId")
-        ts = parts.get("ts")
-        if ts is None or not re.fullmatch(r"[+-]?\d+", ts):
+        ts = parse_long(parts.get("ts"))
+        if ts is None:
             return None, err(401, "missing ts")
         sig = parts.get("sig")
         if sig is None:
             return None, err(401, "missing sig")
-        if abs(int(time.time()) - int(ts)) > TS_TOLERANCE_SEC:
+        if abs(int(time.time()) - ts) > TS_TOLERANCE_SEC:
             return None, err(401, "timestamp out of window")
         token = self.state.tokens.get(token_id)
         if token is None:
             return None, err(401, "unknown token")
-        expected = lan_signature(token["tokenHmac"], token_id, ts, method, path, body)
+        # The terminal signs the parsed Long, so "+0123" is verified as "123".
+        expected = lan_signature(token["tokenHmac"], token_id, str(ts), method, path, body)
         if not hmac.compare_digest(expected.encode(), sig.encode()):
             return None, err(401, "invalid signature")
         return {**token, "tokenId": token_id}, None
@@ -866,6 +885,7 @@ class LanApi:
         ref, amount = str_field(req, "ref"), long_field(req, "amountCents")
         for opt in ("cashierId", "tillId", "description"):
             str_field(req, opt, required=False)
+        bool_field(req, "printReceipt")     # Gson throws before NapsPay is ever called
         detail = f"ref={ref} amount={amount}"
         now_ms = int(time.time() * 1000)
 
@@ -963,17 +983,54 @@ def make_http_server(host: str, port: int, api: LanApi) -> ThreadingHTTPServer:
         def log_message(self, *a) -> None:
             pass    # one line per request is logged by _dispatch
 
+        def _read_body(self) -> bytes:
+            """Content-Length or chunked framing; raises ValueError on malformed framing."""
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                body = b""
+                while True:
+                    size_line = self.rfile.readline(1024)
+                    if not size_line.endswith(b"\n"):
+                        raise ValueError("truncated chunk size")
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                    if size == 0:
+                        break
+                    chunk = self.rfile.read(size)
+                    if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                        raise ValueError("truncated chunk")
+                    body += chunk
+                while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                    pass    # trailers
+                return body
+            length = self.headers.get("Content-Length")
+            if length is None:
+                return b""
+            if not re.fullmatch(r"[0-9]+", length.strip()):
+                raise ValueError(f"invalid Content-Length {length!r}")
+            n = int(length)
+            body = self.rfile.read(n)
+            if len(body) != n:
+                raise ValueError("body shorter than Content-Length")
+            return body
+
         def _dispatch(self) -> None:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(n) if n > 0 else b""
             ip = self.client_address[0]
-            reply = api.handle(self.command, self.path, self.headers, body, ip)
+            try:
+                body = self._read_body()
+            except ValueError as e:
+                # Framing is unknown past this point: answer like the catch-all and close.
+                log.debug(f"[{ip}] bad request framing: {e}")
+                body, reply = b"", err(500, "internal error")
+                self.close_connection = True
+            else:
+                reply = api.handle(self.command, self.path, self.headers, body, ip)
 
             payload = gson_bytes(reply.body) if reply.body is not None else b""
             self.send_response(reply.status)
             if reply.body is not None:
                 self.send_header("Content-Type", "application/json; charset=UTF-8")
             self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             if payload:
                 self.wfile.write(payload)

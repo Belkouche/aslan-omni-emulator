@@ -358,6 +358,57 @@ class AuthTests(EmuTestCase):
         hdr = self.auth_header(self.token, "POST", "/pay", b'{"ref":"other","amountCents":1000}')
         self.assert401(hdr, "invalid signature")
 
+    def test_ts_parsed_as_long_and_signed_canonically(self):
+        now = int(time.time())
+        canonical = self.auth_header(self.token, "POST", "/pay", self.body, ts=now)
+        sig = canonical.rsplit("sig=", 1)[1]
+        # "+<ts>" / "0<ts>" are the same Long; the terminal signs its decimal form.
+        status, res = self.post(f"OMNI-TOKEN tokenId={self.token[0]},ts=+{now},sig={sig}")
+        self.assertEqual((status, res["status"]), (200, "approved"))
+        status, res = self.post(f"OMNI-TOKEN tokenId={self.token[0]},ts=0{now},sig={sig}")
+        self.assertEqual(status, 200)
+        signed_text = self.auth_header(self.token, "POST", "/pay", self.body, ts=f"+{now}")
+        self.assert401(signed_text, "invalid signature")
+        for bad in ("9223372036854775808", "-9223372036854775809", "1e3", "12.5", "+", ""):
+            self.assert401(f"OMNI-TOKEN tokenId={self.token[0]},ts={bad},sig={sig}", "missing ts")
+        self.assert401(f"OMNI-TOKEN tokenId={self.token[0]},ts=9223372036854775807,sig={sig}",
+                       "timestamp out of window")
+
+    def raw_request(self, data: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", self.emu.lan_port), timeout=5) as s:
+            s.sendall(data)
+            out = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    return out
+                out += chunk
+
+    def test_invalid_content_length_gets_terminal_style_500(self):
+        for length in (b"abc", b"-1", b"10"):    # last one: body shorter than declared, then EOF
+            req = b"POST /pay HTTP/1.1\r\nHost: x\r\nContent-Length: " + length + b"\r\n\r\n{}"
+            with socket.create_connection(("127.0.0.1", self.emu.lan_port), timeout=5) as s:
+                s.sendall(req)
+                s.shutdown(socket.SHUT_WR)
+                out = b""
+                while chunk := s.recv(4096):
+                    out += chunk
+            self.assertTrue(out.startswith(b"HTTP/1.1 500"), out)
+            self.assertTrue(out.endswith(b'{"error":"internal error"}'), out)
+
+    def test_chunked_body_is_decoded_before_hashing(self):
+        body = b'{"ref":"CHUNKED-1","amountCents":1000}'
+        hdr = self.auth_header(self.token, "POST", "/pay", body)
+        conn = http.client.HTTPConnection("127.0.0.1", self.emu.lan_port, timeout=5)
+        conn.request("POST", "/pay", body=iter([body[:10], body[10:25], body[25:]]),
+                     headers={"Authorization": hdr, "Content-Type": "application/json"}, encode_chunked=True)
+        r = conn.getresponse()
+        res = json.loads(r.read())
+        self.assertEqual((r.status, res["status"], res["ref"]), (200, "approved", "CHUNKED-1"))
+        conn.request("GET", "/health")      # connection still usable after a chunked request
+        self.assertEqual(conn.getresponse().status, 200)
+        conn.close()
+
     def test_malformed_pay_body_with_valid_auth_is_500(self):
         for body in (b"{oops", b'{"ref":"X"}', b'{"amountCents":1000}', b'{"ref":"X","amountCents":"abc"}'):
             hdr = self.auth_header(self.token, "POST", "/pay", body)
@@ -411,21 +462,36 @@ class PayTests(EmuTestCase):
         self.assertEqual(self.pay("OK-1", 1000, self.token)[:2], (409, {"error": "ref already in progress"}))
 
     def test_concurrent_same_ref_gets_409(self):
-        self.emu.cfg.delay = 0.4
-        results = []
+        started, release = threading.Event(), threading.Event()
+        real_pay = self.emu.engine.pay
 
-        def go():
-            results.append(self.pay("RACE", 1000, self.token)[:2])
+        def held_pay(*args, **kwargs):      # hold the first charge "on the card screen"
+            started.set()
+            release.wait(5)
+            return real_pay(*args, **kwargs)
 
-        threads = [threading.Thread(target=go) for _ in range(2)]
-        threads[0].start()
-        time.sleep(0.1)
-        threads[1].start()
-        for t in threads:
-            t.join()
-        statuses = sorted(r[0] for r in results)
-        self.assertEqual(statuses, [200, 409])
-        self.assertIn((409, {"error": "ref already in progress"}), results)
+        self.emu.engine.pay = held_pay
+        first = []
+        t = threading.Thread(target=lambda: first.append(self.pay("RACE", 1000, self.token)[:2]))
+        t.start()
+        self.assertTrue(started.wait(5))
+        self.assertEqual(self.pay("RACE", 1000, self.token)[:2], (409, {"error": "ref already in progress"}))
+        release.set()
+        t.join(5)
+        self.assertEqual(first[0][0], 200)
+        self.assertEqual(first[0][1]["status"], "approved")
+
+    def test_print_receipt_uses_gson_boolean_coercion(self):
+        for value in (True, False, None, "true", "FALSE", "yes"):     # Gson: any string → parseBoolean
+            status, res, _ = self.signed("POST", "/pay", {"ref": f"PR-{value}", "amountCents": 1000,
+                                                          "printReceipt": value}, self.token)
+            self.assertEqual((status, res["status"]), (200, "approved"), value)
+        for value in ({}, [], 1, 0.5):
+            ref = f"PRX-{type(value).__name__}"
+            status, res, _ = self.signed("POST", "/pay", {"ref": ref, "amountCents": 1000,
+                                                          "printReceipt": value}, self.token)
+            self.assertEqual((status, res), (500, {"error": "internal error"}), value)
+            self.assertNotIn(ref, self.emu.state.transactions)      # refused before charging
 
 
 # ── Reversal and admin routes ─────────────────────────────────────────────────
