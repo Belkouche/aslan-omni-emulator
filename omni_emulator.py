@@ -926,8 +926,9 @@ class LanApi:
 def make_http_server(host: str, port: int, api: LanApi) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "Ktor/emulated"
-        sys_version = ""
+
+        def version_string(self) -> str:
+            return "Ktor/emulated"
 
         def log_message(self, *a) -> None:
             pass    # one line per request is logged by _dispatch
@@ -1493,7 +1494,12 @@ def main() -> None:
 
     cloud = None
     if args.relay:
-        token = acquire_device_token(args.relay, cfg, args.token_file, args.device_token, args.save_token)
+        try:
+            token = acquire_device_token(args.relay, cfg, args.token_file, args.device_token, args.save_token)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log.error(f"[cloud] cannot get a device token from {api_root(args.relay)} — {e}")
+            emu.stop()
+            sys.exit(1)
         cloud = CloudDevice(args.relay, token, emu)
         CONSOLE_COMMANDS["p"] = cloud.initiate_pairing
         cloud.start()
