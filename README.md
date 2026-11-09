@@ -370,9 +370,11 @@ the same path a production app uses to reach a terminal in another city.
         caller                                          the broker                    the terminal
 ```
 
-Your app never talks to the emulator directly. The emulator connects **out** to
-the cloud (no inbound ports), waits for commands on a long-lived SSE stream, runs
-the outcome engine and posts the result back.
+Your app never talks to the emulator directly. The cloud half only connects
+**out**: it waits for commands on a long-lived SSE stream, runs the outcome
+engine and posts the result back. With `--no-lan --relay` nothing listens on your
+machine; `--relay` alone also starts the LAN half (HTTP 8080 and UDP 8481 on
+`0.0.0.0`).
 
 ### Step 1 — start it
 
@@ -509,7 +511,10 @@ parser decodes them).
 State lives in `~/.aslan-omni-emulator/terminal.json` (`--state-file`): paired
 tokens, transactions, the admin key and the discovery key, so pairings and
 idempotency survive restarts. Transactions still `pending` for more than 2 min at
-start-up become `timeout` (their `ref` can be retried). `--fresh` starts empty.
+start-up become `timeout` (their `ref` can be retried). `--fresh` starts empty. A state
+file that exists but cannot be read or parsed stops start-up with an error and is
+left untouched (keys and tokens are never silently replaced); move it away or pass
+`--fresh`.
 Pairing sessions are kept in memory only. The state file and the device-token
 file hold secrets, so they are written `0600` (and `~/.aslan-omni-emulator`, when
 the emulator creates it, `0700`).
@@ -556,6 +561,7 @@ if the suite pairs non-interactively.
 
 | Symptom | Likely cause and fix |
 |---------|----------------------|
+| `cannot read state file …` / `unexpected shape` | The state file is corrupt or unreadable. It was not modified: fix its permissions, move it away, or start with `--fresh`. |
 | `Cannot bind 0.0.0.0 (HTTP 8080 / UDP 8481)` | Another emulator or service holds the port. Use `--lan-port` / `--udp-port`, or find it with `lsof -nP -iTCP:8080 -sTCP:LISTEN`. |
 | Discovery finds nothing | Firewall blocking UDP 8481, or client and emulator on different subnets. Unicast the probe to the banner's LAN IP. |
 | `500 internal error` on `/pair/request` | Missing `posId`/`posLabel`/`clientNonce`, or no `Content-Type: application/json`. |
