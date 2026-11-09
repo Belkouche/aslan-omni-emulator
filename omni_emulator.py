@@ -52,6 +52,7 @@ Fidelity notes (terminal main f8f74dd, cloud API main 5c34b1d):
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -238,6 +239,22 @@ def long_field(req: dict, name: str) -> int:
     if not isinstance(v, int):
         raise ValueError(f"{name} is not a number")
     return v
+
+
+def write_private(path: str, text: str) -> None:
+    """Atomically write a secret-bearing file: dir 0o700 (when created), file 0o600."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")    # mkstemp creates it 0o600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+        raise
 
 
 # ── Crypto ────────────────────────────────────────────────────────────────────
@@ -609,11 +626,7 @@ class TerminalState:
         with self.lock:
             data = {"adminKey": self.admin_key, "discoveryKey": self.discovery_key.hex(),
                     "tokens": self.tokens, "transactions": self.transactions}
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.path)), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=1)
-            os.replace(tmp, self.path)
+            write_private(self.path, json.dumps(data, indent=1))
 
     def reap_stuck_pending(self, older_than: float = STALE_PENDING_SEC) -> int:
         """A payment killed mid-flight must not wedge its ref at 409 forever."""
@@ -1062,9 +1075,7 @@ def _cloud_json(root: str, method: str, path: str, body_obj: dict | None = None)
 
 
 def save_device_token(path: str, rec: dict) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh)
+    write_private(path, json.dumps(rec))
 
 
 def load_device_token(path: str, base: str) -> dict | None:

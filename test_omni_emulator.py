@@ -610,6 +610,28 @@ class PersistenceTests(EmuTestCase):
         self.assertEqual(self.pay("X", 1000, token, emu3)[:2], (401, {"error": "unknown token"}))
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX file modes")
+class FilePermissionTests(unittest.TestCase):
+
+    def test_state_and_token_files_are_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.umask(0o022)       # typical umask: would leave files world-readable
+            try:
+                state_dir = os.path.join(tmp, "state")
+                state_file = os.path.join(state_dir, "terminal.json")
+                emu = omni.Emulator(omni.Config(lan=False, state_file=state_file))
+                emu.state.save()
+                token_file = os.path.join(tmp, "tok", "device.json")
+                omni.save_device_token(token_file, {"deviceToken": "secret", "cloudBase": "http://x"})
+            finally:
+                os.umask(old)
+            self.assertEqual(os.stat(state_file).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(token_file).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(state_dir).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(os.path.dirname(token_file)).st_mode & 0o777, 0o700)
+            self.assertEqual(sorted(os.listdir(state_dir)), ["terminal.json"])   # no temp leftovers
+
+
 # ── Cloud half against a fake aslan-omni-api ──────────────────────────────────
 
 DEVICE_TOKEN = "omni_dev_token_123"
