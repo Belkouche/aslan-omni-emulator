@@ -1,62 +1,284 @@
 #!/usr/bin/env python3
-"""Aslan Omni terminal + cloud-device emulator (stdlib only)."""
+"""
+Aslan Omni Terminal Emulator
+============================
+Behaves like a real Aslan Omni terminal (app v1.3.5) on your LAN — UDP discovery
+on 8481, HTTP API on 8080 with PIN pairing and OMNI-TOKEN signed requests — and,
+with --relay, like a cloud-onboarded device driven by the Aslan Omni cloud API.
+
+Usage:
+    python3 omni_emulator.py                          # LAN terminal, approve all
+    python3 omni_emulator.py --mode decline           # every payment RC=100
+    python3 omni_emulator.py --mode error --code insufficient_funds
+    python3 omni_emulator.py --mode cancel            # customer cancels (RC=099)
+    python3 omni_emulator.py --mode timeout --timeout-after 5
+    python3 omni_emulator.py --mode reversal_decline --code 909
+    python3 omni_emulator.py --mode interactive       # prompt per payment
+    python3 omni_emulator.py --delay 3                # 3 s of simulated card time
+    python3 omni_emulator.py --relay                  # LAN + cloud device (staging)
+    python3 omni_emulator.py --no-lan --relay         # cloud device only
+    python3 omni_emulator.py --selfcheck              # verify the crypto, then exit
+
+Supported modes:
+    approve           Payments approved, reversals succeed (default)
+    decline           Payments declined RC=100 (do not honour)
+    error             Payments declined with --code (name or number)
+    cancel            Payments cancelled by the customer (RC=099)
+    timeout           Payments wait --timeout-after s (default 90) then time out
+    reversal_decline  Payments approved, reversals declined with --code (default 909)
+    reversal_timeout  Payments approved, reversals wait --timeout-after s then fail
+    interactive       Prompt the operator per payment; auto-approve after 120 s
+
+Magic amounts (override --mode for payments, LAN and cloud):
+    amountCents ending in 00 → approved      05 → declined RC=005
+                          08 → cancelled     51 → timeout (answered at once)
+
+Named scenarios for --code:
+    approved, insufficient_funds, expired_card, wrong_pin, pin_attempts_exceeded,
+    suspected_fraud, do_not_honour, card_not_active, transaction_not_allowed,
+    exceeds_limits, invalid_cvv, cancelled, already_cancelled, system_down,
+    issuer_unavailable, server_error, record_not_found
+
+Console commands (type + Enter while running):
+    p    request a new cloud pairing code (--relay)
+
+Fidelity notes (terminal main f8f74dd, cloud API main 5c34b1d):
+    The emulator follows the terminal, not the SDKs: no /reverse alias (404),
+    /admin/pos returns createdAt (epoch seconds) and no pairedAt, unknown routes
+    are 404 with an empty body, malformed or incomplete JSON is 500
+    {"error":"internal error"}. JSON is Gson-shaped: compact, nulls omitted,
+    '=' '<' '>' '&' "'" escaped as \\u00XX.
+"""
+
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import queue
 import random
+import re
 import secrets
+import shutil
 import socket
 import sys
+import tempfile
+import textwrap
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ── Scenario table (same as the NAPS emulator) ──────────────────────────────
-SCENARIOS = {
-    "insufficient_funds": "116",
-    "wrong_pin": "117",
-    "pin_attempts_exceeded": "106",
-    "expired_card": "101",
-    "suspected_fraud": "102",
-    "do_not_honour": "100",
-    "card_not_active": "118",
-    "transaction_not_allowed": "120",
-    "exceeds_limits": "121",
-    "use_chip": "265",
-    "pin_failed": "281",
-    "system_down": "909",
-    "issuer_unavailable": "912",
-    "server_error": "995",
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("omni-emulator")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+VERSION               = "1.3.5"      # BuildConfig.VERSION_NAME of the emulated release
+DEFAULT_MODEL         = "P3"
+HTTP_PORT             = 8080
+UDP_PORT              = 8481
+PAYMENT_TIMEOUT_SEC   = 90           # NapsPay app2app wait before a payment times out
+TS_TOLERANCE_SEC      = 300          # OMNI-TOKEN timestamp window (±5 min)
+SESSION_TTL_SEC       = 120          # pairing session lifetime
+PIN_DIGITS            = 6
+PIN_MAX_ATTEMPTS      = 5            # wrong PINs before a session locks
+RATE_LIMIT_MAX        = 5            # per IP, shared by /pair/request + /pair/confirm
+RATE_LIMIT_WINDOW_SEC = 60
+CONFIRM_GLOBAL_MAX    = 15           # /pair/confirm across all IPs per window
+BEACON_INTERVAL_SEC   = 30
+STALE_PENDING_SEC     = 120          # pending rows older than this become timeout at start
+INTERACTIVE_TIMEOUT_SEC = 120
+DEFAULT_CODE          = "909"
+DISCOVERY_PREFIX      = "OMNI-DISC:"
+BEACON_PREFIX         = "OMNI-BEACON:"
+
+MASKED_CARD = "516794******3315"
+CARD_SCHEME = "MASTERCARD"
+
+CLOUD_BASE           = "https://staging-api.aslanpay.ma"
+CLAIM_POLL_SEC       = 3
+SSE_BACKOFF_BASE_SEC = 3
+SSE_BACKOFF_MAX_SEC  = 60
+# Cloudflare (in front of staging/prod) rejects the default "Python-urllib" UA.
+USER_AGENT = f"AslanOmniEmulator/{VERSION} (device)"
+
+STATE_DIR          = os.path.expanduser("~/.aslan-omni-emulator")
+DEFAULT_STATE_FILE = os.path.join(STATE_DIR, "terminal.json")
+DEFAULT_TOKEN_FILE = os.path.join(STATE_DIR, "device.json")
+
+MODES = ["approve", "decline", "error", "cancel", "timeout",
+         "reversal_decline", "reversal_timeout", "interactive"]
+
+# ── ISO 8583 / NAPS response code scenarios ───────────────────────────────────
+
+# Same table as tkpay-naps-emulator (TLV Protocol Specification v2.0 §6).
+SCENARIOS: dict[str, tuple[str, str]] = {
+    # name                  : (code, label)
+    "approved"              : ("000", "Approved"),
+    "do_not_honour"         : ("100", "Do not honour"),
+    "expired_card"          : ("101", "Card expired"),
+    "suspected_fraud"       : ("102", "Fraud suspected"),
+    "pin_attempts_exceeded" : ("106", "Allowed PIN tries exceeded"),
+    "wrong_pin"             : ("117", "Incorrect PIN"),
+    "insufficient_funds"    : ("116", "Insufficient funds"),
+    "card_not_active"       : ("118", "Card not registered"),
+    "transaction_not_allowed": ("120", "Transaction not permitted at terminal"),
+    "exceeds_limits"        : ("121", "Withdrawal limit exceeded"),
+    "invalid_cvv"           : ("183", "Invalid CVV"),
+    "cancelled"             : ("280", "Alternative amount cancelled"),
+    "record_not_found"      : ("302", "Record not found on file"),
+    "already_cancelled"     : ("482", "Transaction already cancelled"),
+    "system_down"           : ("909", "System failure"),
+    "issuer_unavailable"    : ("912", "Card issuer unavailable"),
+    "server_error"          : ("995", "Server processing error"),
 }
+
+# Ordered list for the interactive decline menu (most common first)
+DECLINE_MENU: list[str] = [
+    "insufficient_funds",
+    "wrong_pin",
+    "pin_attempts_exceeded",
+    "expired_card",
+    "suspected_fraud",
+    "do_not_honour",
+    "card_not_active",
+    "transaction_not_allowed",
+    "exceeds_limits",
+    "invalid_cvv",
+    "system_down",
+    "issuer_unavailable",
+    "server_error",
+]
 
 
 def resolve_code(code: str) -> str:
-    """Map a scenario name to its numeric RC; pass a numeric code through unchanged."""
-    return SCENARIOS.get(code, code)
+    """Resolve a scenario name or raw code string to a 3-digit RC."""
+    if code in SCENARIOS:
+        return SCENARIOS[code][0]
+    return code
 
 
-# ── Amount-suffix magic values (deterministic outcomes for CI) ──────────────
-_MAGIC = {0: "approved", 5: "declined", 8: "cancelled", 51: "timeout"}
+def code_label(rc: str) -> str:
+    return next((v[1] for v in SCENARIOS.values() if v[0] == rc), rc)
 
 
-def magic_outcome(amount_centimes: int) -> str | None:
-    """Return an outcome forced by the amount's last two digits, or None."""
-    suffix = amount_centimes % 100
-    if suffix == 51:
-        return "timeout"
-    if suffix in (0, 5, 8):
-        return _MAGIC[suffix]
-    return None
+# ── Magic amounts ─────────────────────────────────────────────────────────────
+
+def magic_outcome(amount_cents: int) -> str | None:
+    """Outcome forced by the amount's last two digits, or None (falls through to --mode)."""
+    return {0: "approved", 5: "declined", 8: "cancelled", 51: "timeout"}.get(amount_cents % 100)
 
 
-# ── HMAC / hashing ──────────────────────────────────────────────────────────
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+
+def drop_nulls(obj):
+    """Gson's default: null map values are not serialized."""
+    if isinstance(obj, dict):
+        return {k: drop_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [drop_nulls(v) for v in obj]
+    return obj
+
+
+# Gson escapes these by default (HTML-safe output); they only ever occur inside strings.
+_GSON_ESCAPES = {"<": "\\u003c", ">": "\\u003e", "&": "\\u0026", "=": "\\u003d",
+                 "'": "\\u0027", " ": "\\u2028", " ": "\\u2029"}
+
+
+def gson_bytes(obj) -> bytes:
+    """Serialize like the terminal's Gson: compact, nulls dropped, HTML chars escaped."""
+    text = json.dumps(drop_nulls(obj), separators=(",", ":"), ensure_ascii=False)
+    for ch, esc in _GSON_ESCAPES.items():
+        text = text.replace(ch, esc)
+    return text.encode("utf-8")
+
+
+def android_json_bytes(obj: dict) -> bytes:
+    """Serialize like Android's org.json JSONObject.toString(): compact, '/' escaped."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).replace("/", "\\/").encode("utf-8")
+
+
+def str_field(req: dict, name: str, required: bool = True) -> str | None:
+    """Read a String DTO field the way Gson does (numbers/booleans coerce to text)."""
+    v = req.get(name)
+    if v is None:
+        if required:
+            raise ValueError(f"missing {name}")
+        return None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return json.dumps(v)
+    if isinstance(v, str):
+        return v
+    raise ValueError(f"{name} is not a string")
+
+
+def long_field(req: dict, name: str) -> int:
+    """Read a Long DTO field the way Gson does (integral numbers or numeric strings)."""
+    v = req.get(name)
+    if isinstance(v, bool) or v is None:
+        raise ValueError(f"missing {name}")
+    if isinstance(v, str):
+        v = float(v) if re.fullmatch(r"[+-]?\d+\.\d*", v.strip()) else int(v.strip())
+    if isinstance(v, float):
+        if not v.is_integer():
+            raise ValueError(f"{name} is not integral")
+        v = int(v)
+    if not isinstance(v, int):
+        raise ValueError(f"{name} is not a number")
+    return v
+
+
+def parse_long(text: str | None) -> int | None:
+    """Kotlin String.toLongOrNull(): optional sign, ASCII digits, signed 64-bit range."""
+    if text is None or not re.fullmatch(r"[+-]?[0-9]+", text):
+        return None
+    value = int(text)
+    return value if -(2 ** 63) <= value < 2 ** 63 else None
+
+
+def bool_field(req: dict, name: str) -> bool | None:
+    """Read a Boolean DTO field the way Gson does: booleans, any string (parseBoolean) or null."""
+    v = req.get(name)
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() == "true"
+    raise ValueError(f"{name} is not a boolean")
+
+
+def write_private(path: str, text: str) -> None:
+    """Atomically write a secret-bearing file: dir 0o700 (when created), file 0o600."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")    # mkstemp creates it 0o600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+        raise
+
+
+# ── Crypto ────────────────────────────────────────────────────────────────────
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -65,12 +287,9 @@ def hmac_hex(key: bytes, data: bytes) -> str:
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
-# ── RSA-OAEP-SHA256 (stdlib only — mirrors the terminal's #4b encryption) ────
-# The real terminal returns the pairing tokenSecret encrypted to the POS's
-# ephemeral RSA public key so it never crosses the LAN in cleartext. Python's
-# stdlib has no RSA, so we implement just the encrypt side (SPKI parse + OAEP
-# pad + modular exponentiation). Must match RSA/ECB/OAEPWithSHA-256AndMGF1Padding
-# so the SDK (WebCrypto / .NET RSA-OAEP-SHA256) can decrypt.
+# RSA-OAEP-SHA256 encrypt (stdlib has no RSA). The terminal returns the pairing
+# tokenSecret encrypted to the POS's ephemeral SPKI public key; this must match
+# RSA/ECB/OAEPWithSHA-256AndMGF1Padding so WebCrypto / .NET can decrypt it.
 
 def _der_len(data: bytes, i: int) -> tuple[int, int]:
     """Read a DER length at offset i; return (length, next_offset)."""
@@ -78,30 +297,34 @@ def _der_len(data: bytes, i: int) -> tuple[int, int]:
     if b < 0x80:
         return b, i
     n = b & 0x7F
-    length = int.from_bytes(data[i:i + n], "big")
-    return length, i + n
+    return int.from_bytes(data[i:i + n], "big"), i + n
 
 
 def _parse_spki_rsa(spki: bytes) -> tuple[int, int]:
     """Extract (modulus n, public exponent e) from an SPKI/DER RSA public key."""
     # SPKI: SEQ { SEQ { OID rsaEncryption, NULL }, BIT STRING { RSAPublicKey } }
     i = 0
-    assert spki[i] == 0x30; _, i = _der_len(spki, i + 1)      # outer SEQUENCE
-    assert spki[i] == 0x30; alg_len, j = _der_len(spki, i + 1)  # AlgorithmIdentifier
-    i = j + alg_len                                            # skip algorithm
-    assert spki[i] == 0x03; bit_len, i = _der_len(spki, i + 1)  # BIT STRING
-    assert spki[i] == 0x00; i += 1                             # unused-bits byte
-    assert spki[i] == 0x30; _, i = _der_len(spki, i + 1)      # RSAPublicKey SEQUENCE
-    assert spki[i] == 0x02; n_len, i = _der_len(spki, i + 1)  # INTEGER modulus
+    if spki[i] != 0x30: raise ValueError("not an SPKI SEQUENCE")
+    _, i = _der_len(spki, i + 1)
+    if spki[i] != 0x30: raise ValueError("no AlgorithmIdentifier")
+    alg_len, j = _der_len(spki, i + 1)
+    i = j + alg_len
+    if spki[i] != 0x03: raise ValueError("no BIT STRING")
+    _, i = _der_len(spki, i + 1)
+    if spki[i] != 0x00: raise ValueError("bad unused-bits byte")
+    i += 1
+    if spki[i] != 0x30: raise ValueError("no RSAPublicKey")
+    _, i = _der_len(spki, i + 1)
+    if spki[i] != 0x02: raise ValueError("no modulus")
+    n_len, i = _der_len(spki, i + 1)
     n = int.from_bytes(spki[i:i + n_len], "big"); i += n_len
-    assert spki[i] == 0x02; e_len, i = _der_len(spki, i + 1)  # INTEGER exponent
-    e = int.from_bytes(spki[i:i + e_len], "big")
-    return n, e
+    if spki[i] != 0x02: raise ValueError("no exponent")
+    e_len, i = _der_len(spki, i + 1)
+    return n, int.from_bytes(spki[i:i + e_len], "big")
 
 
 def _mgf1_sha256(seed: bytes, length: int) -> bytes:
-    out = b""
-    counter = 0
+    out, counter = b"", 0
     while len(out) < length:
         out += hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
         counter += 1
@@ -110,365 +333,852 @@ def _mgf1_sha256(seed: bytes, length: int) -> bytes:
 
 def rsa_oaep_encrypt_b64(spki_b64: str, message: bytes) -> str:
     """RSA-OAEP-SHA256 encrypt `message` to the SPKI public key; return base64."""
-    n, e = _parse_spki_rsa(base64.b64decode(spki_b64))
-    k = (n.bit_length() + 7) // 8           # modulus size in bytes
-    h_len = 32                              # SHA-256
+    n, e = _parse_spki_rsa(base64.b64decode(spki_b64, validate=True))
+    k = (n.bit_length() + 7) // 8
+    h_len = 32
     if len(message) > k - 2 * h_len - 2:
         raise ValueError("message too long for RSA-OAEP")
-    l_hash = hashlib.sha256(b"").digest()   # empty label
-    ps = b"\x00" * (k - len(message) - 2 * h_len - 2)
-    db = l_hash + ps + b"\x01" + message
+    db = hashlib.sha256(b"").digest() + b"\x00" * (k - len(message) - 2 * h_len - 2) + b"\x01" + message
     seed = secrets.token_bytes(h_len)
-    db_mask = _mgf1_sha256(seed, k - h_len - 1)
-    masked_db = bytes(a ^ b for a, b in zip(db, db_mask))
-    seed_mask = _mgf1_sha256(masked_db, h_len)
-    masked_seed = bytes(a ^ b for a, b in zip(seed, seed_mask))
-    em = b"\x00" + masked_seed + masked_db
-    c = pow(int.from_bytes(em, "big"), e, n)
+    masked_db = bytes(a ^ b for a, b in zip(db, _mgf1_sha256(seed, k - h_len - 1)))
+    masked_seed = bytes(a ^ b for a, b in zip(seed, _mgf1_sha256(masked_db, h_len)))
+    c = pow(int.from_bytes(b"\x00" + masked_seed + masked_db, "big"), e, n)
     return base64.b64encode(c.to_bytes(k, "big")).decode()
 
 
-def lan_expected_sig(token_hmac_hex: str, token_id: str, ts: str,
-                     method: str, path: str, body: bytes) -> str:
-    """The signature the emulator expects for an inbound LAN request.
-
-    Derived-key scheme: key = hexToBytes(tokenHmac); tokenHmac was HMAC(secret, tokenId).
-    """
-    key = bytes.fromhex(token_hmac_hex)
+def lan_signature(token_hmac_hex: str, token_id: str, ts: str, method: str, path: str, body: bytes) -> str:
+    """LAN OMNI-TOKEN signature. Key = bytes of tokenHmac, where tokenHmac = HMAC(secret, tokenId)."""
     msg = f"{token_id}:{ts}:{method}:{path}:{sha256_hex(body)}"
-    return hmac_hex(key, msg.encode())
-
-
-def device_sig(device_token: str, ts: str, method: str, path: str, body: bytes) -> str:
-    """The signature the emulator SENDS as a cloud device.
-
-    Raw-key scheme: key = deviceToken utf-8; message includes the token as tokenId.
-    """
-    msg = f"{device_token}:{ts}:{method}:{path}:{sha256_hex(body)}"
-    return hmac_hex(device_token.encode(), msg.encode())
+    return hmac_hex(bytes.fromhex(token_hmac_hex), msg.encode())
 
 
 def device_auth_header(device_token: str, method: str, path: str, body: bytes) -> str:
+    """Cloud device OMNI-TOKEN header. Key = utf8(deviceToken); tokenId = deviceToken."""
     ts = str(int(time.time()))
-    sig = device_sig(device_token, ts, method, path, body)
-    return f"OMNI-TOKEN tokenId={device_token},ts={ts},sig={sig}"
+    msg = f"{device_token}:{ts}:{method}:{path}:{sha256_hex(body)}"
+    return f"OMNI-TOKEN tokenId={device_token},ts={ts},sig={hmac_hex(device_token.encode(), msg.encode())}"
 
 
-# ── Outcome engine ──────────────────────────────────────────────────────────
-def _gen_stan() -> str:  return f"{random.randint(1, 999999):06d}"
-def _gen_auth() -> str:  return f"{random.randint(100000, 999999)}"
-def _gen_rrn() -> str:   return f"{random.randint(0, 10**12 - 1):012d}"
+# ── Console ───────────────────────────────────────────────────────────────────
 
-MASKED_CARD = "516794******3315"
-CARD_SCHEME = "MASTERCARD"
+QUIET = False   # tests silence boxes and prompts
 
 
-def decide_outcome(amount_centimes: int, mode: str, error_code: str) -> dict:
-    """Resolve a payment to an outcome. Magic amount overrides mode."""
-    status = magic_outcome(amount_centimes)
-    rc = "000"
+def say(text: str = "") -> None:
+    if not QUIET:
+        print(text, flush=True)
 
-    if status is None:
-        if mode == "approve":
-            status = "approved"
-        elif mode == "decline":
-            status, rc = "declined", "005"
-        elif mode == "error":
-            status, rc = "declined", resolve_code(error_code)
-        elif mode == "timeout":
-            status = "timeout"
-        else:  # "interactive" — caller overrides this with ask_operator(); default approve
-            status = "approved"
-    elif status == "declined":
-        rc = "005"
 
-    out = {"status": status, "responseCode": rc if status in ("approved", "declined") else None}
-    if status == "approved":
+def boxed(title: str, lines: list[str], indent: int = 12) -> str:
+    """A box no wider than the terminal; long lines wrap with a continuation indent."""
+    max_w = max(44, shutil.get_terminal_size((80, 24)).columns - 4)
+    w = min(max_w, max([len(title) + 2] + [len(l) + 4 for l in lines] + [44]))
+    lines = [part for l in lines
+             for part in (textwrap.wrap(l, w - 4, subsequent_indent=" " * indent, break_on_hyphens=False)
+                          or [""])]
+    out = [f"  ┌{'─' * w}┐", f"  │{title:^{w}}│", f"  ├{'─' * w}┤"]
+    out += [f"  │  {l:<{w - 2}}│" for l in lines]
+    out.append(f"  └{'─' * w}┘")
+    return "\n".join(out)
+
+
+def lan_ip() -> str:
+    """Best-effort primary LAN address (no packet is sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+# ── Interactive decision prompt ───────────────────────────────────────────────
+
+_prompt_lock   = threading.Lock()
+_prompt_active = threading.Event()
+_stdin_queue: queue.Queue[str] = queue.Queue()
+CONSOLE_COMMANDS: dict = {}     # "p" → callable, registered by main()
+
+
+def _stdin_reader() -> None:
+    """Route stdin lines: to the open prompt if there is one, else to console commands."""
+    while True:
+        try:
+            line = input().strip().lower()
+        except EOFError:
+            _stdin_queue.put("a")
+            break
+        if _prompt_active.is_set():
+            _stdin_queue.put(line)
+        elif line in CONSOLE_COMMANDS:
+            threading.Thread(target=CONSOLE_COMMANDS[line], daemon=True).start()
+        elif line:
+            say(f"  Unknown command {line!r}" + ("  (p = new cloud pairing code)" if CONSOLE_COMMANDS else ""))
+
+
+def ask_operator(source: str, ref: str, amount_cents: int, timeout: float,
+                 cancel: threading.Event | None = None) -> tuple[str, str | None]:
+    """
+    Prompt the operator for one payment. Returns (choice, rc) where choice is
+    approve / decline / cancel / timeout. One prompt at a time.
+    """
+    with _prompt_lock:
+        say(f"\n  ┌── Payment from {source} ──────────────────────────")
+        say(f"  │  Ref    : {ref}")
+        say(f"  │  Amount : {amount_cents / 100:.2f} MAD")
+        say(f"  │  Card   : {MASKED_CARD}")
+        say("  ├─────────────────────────────────────────────────")
+        say("  │  [a] Approve")
+        for i, name in enumerate(DECLINE_MENU, 1):
+            code, label = SCENARIOS[name]
+            say(f"  │  [{i:2d}] Decline — {label} ({code})")
+        say("  │  [c] Customer cancels (099)")
+        say("  │  [t] Timeout (no answer from NapsPay)")
+        say("  └─────────────────────────────────────────────────")
+        if not QUIET:
+            print("  Choice → ", end="", flush=True)
+        _prompt_active.set()
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    answer = _stdin_queue.get(timeout=max(0.0, min(0.1, deadline - time.monotonic())))
+                except queue.Empty:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    if time.monotonic() < deadline:
+                        continue
+                    say("(timeout → auto-approve)")
+                    return "approve", None
+                if answer in ("a", "approve", "y", "yes", ""):
+                    say("  → APPROVED")
+                    return "approve", None
+                if answer in ("c", "cancel"):
+                    say("  → CANCELLED (099)")
+                    return "cancel", None
+                if answer in ("t", "timeout"):
+                    say("  → TIMEOUT")
+                    return "timeout", None
+                if answer.isdigit() and 1 <= int(answer) <= len(DECLINE_MENU) and len(answer) < 3:
+                    code, label = SCENARIOS[DECLINE_MENU[int(answer) - 1]]
+                    say(f"  → DECLINED ({label} — {code})")
+                    return "decline", code
+                resolved = resolve_code(answer)
+                if resolved != answer or (len(resolved) == 3 and resolved.isdigit()):
+                    say(f"  → DECLINED ({code_label(resolved)} — {resolved})")
+                    return "decline", resolved
+                if not QUIET:
+                    print(f"  Unknown input {answer!r} — type a, c, t, a number, or a code: ", end="", flush=True)
+        finally:
+            _prompt_active.clear()
+
+
+# ── Outcome engine ────────────────────────────────────────────────────────────
+
+@dataclass
+class Config:
+    mode: str = "approve"
+    code: str = DEFAULT_CODE
+    delay: float = 0.0                      # simulated card time before any outcome
+    timeout_after: float = PAYMENT_TIMEOUT_SEC
+    interactive_timeout: float = INTERACTIVE_TIMEOUT_SEC
+    terminal_id: str = "00000001"
+    merchant_id: str = "000000000001"
+    serial: str = f"EMU-{socket.gethostname().split('.')[0]}"
+    model: str = DEFAULT_MODEL
+    host: str = "0.0.0.0"
+    lan_port: int = HTTP_PORT
+    udp_port: int = UDP_PORT
+    lan: bool = True
+    beacon: bool = True
+    state_file: str = DEFAULT_STATE_FILE
+    fresh: bool = False
+
+
+class Cancelled(Exception):
+    """The emulator is shutting down while a simulated payment waits."""
+
+
+def generate_stan() -> str: return f"{random.randint(1, 999999):06d}"
+def generate_auth() -> str: return f"{random.randint(100000, 999999)}"
+
+
+class OutcomeEngine:
+    """
+    Stands in for NapsPay. Returns a NapsPay-style result dict whose "status" is
+    approved / declined / cancelled / timeout; callers map it (LAN reversal:
+    approved → "reversed", cloud: see result_payload).
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._inflight: set[str] = set()
+        self._lock = threading.Lock()
+
+    def _approved(self) -> dict:
         now = datetime.now()
-        out.update({
-            "authNumber": _gen_auth(),
-            "stan": _gen_stan(),
-            "rrn": _gen_rrn(),
-            "cardNumber": MASKED_CARD,
-            "cardScheme": CARD_SCHEME,
-            "transactionDate": now.strftime("%d/%m/%Y"),
-            "transactionTime": now.strftime("%H:%M:%S"),
-        })
-    return out
+        return {
+            "status": "approved", "responseCode": "000",
+            "authNumber": generate_auth(), "stan": generate_stan(),
+            "cardNumber": MASKED_CARD, "cardScheme": CARD_SCHEME,
+            "terminalId": self.cfg.terminal_id, "merchantId": self.cfg.merchant_id,
+            "transactionDate": now.strftime("%d/%m/%Y"), "transactionTime": now.strftime("%H:%M:%S"),
+            "transactionNumber": generate_stan(),
+            # No rrn: NapsPay app2app never fills it.
+        }
+
+    @staticmethod
+    def _declined(rc: str) -> dict:
+        return {"status": "declined", "responseCode": rc}
+
+    @staticmethod
+    def _wait(seconds: float, cancel: threading.Event | None) -> None:
+        if seconds <= 0:
+            return
+        if cancel is None:
+            time.sleep(seconds)
+        elif cancel.wait(seconds):
+            raise Cancelled()
+
+    def _timeout(self, wait: bool, cancel: threading.Event | None = None) -> dict:
+        if wait:
+            self._wait(self.cfg.timeout_after, cancel)
+        return {"status": "timeout"}
+
+    def pay(self, ref: str, amount_cents: int, source: str, cancel: threading.Event | None = None) -> dict:
+        with self._lock:
+            if ref in self._inflight:       # NapsPayBridge: same ref already on screen
+                return self._declined("DUPLICATE")
+            self._inflight.add(ref)
+        try:
+            self._wait(self.cfg.delay, cancel)
+            forced = magic_outcome(amount_cents)
+            if forced == "approved":  return self._approved()
+            if forced == "declined":  return self._declined("005")
+            if forced == "cancelled": return {"status": "cancelled", "responseCode": "099"}
+            if forced == "timeout":   return self._timeout(wait=False)
+
+            mode = self.cfg.mode
+            if mode == "decline":
+                return self._declined("100")
+            if mode == "error":
+                return self._declined(resolve_code(self.cfg.code))
+            if mode == "cancel":
+                return {"status": "cancelled", "responseCode": "099"}
+            if mode == "timeout":
+                return self._timeout(wait=True, cancel=cancel)
+            if mode == "interactive":
+                choice, rc = ask_operator(source, ref, amount_cents, self.cfg.interactive_timeout, cancel)
+                if choice == "decline": return self._declined(rc)
+                if choice == "cancel":  return {"status": "cancelled", "responseCode": "099"}
+                if choice == "timeout": return self._timeout(wait=False)
+            return self._approved()
+        finally:
+            with self._lock:
+                self._inflight.discard(ref)
+
+    def reversal(self, ref: str, stan: str, cancel: threading.Event | None = None) -> dict:
+        self._wait(self.cfg.delay, cancel)
+        if self.cfg.mode == "reversal_decline":
+            return self._declined(resolve_code(self.cfg.code))
+        if self.cfg.mode == "reversal_timeout":
+            return self._timeout(wait=True, cancel=cancel)
+        return self._approved()
 
 
-def pay_result(ref: str, amount_centimes: int, outcome: dict,
-               terminal_id: str = "EMU-TID", merchant_id: str = "EMU-MID") -> dict:
-    """Assemble the flat PayResult JSON the SDK expects (LAN /pay + cloud share it)."""
+def describe(result: dict) -> str:
+    """One-line outcome for the request log."""
+    parts = [result["status"]]
+    if result.get("responseCode"):
+        parts.append(f"RC={result['responseCode']}")
+    if result.get("stan"):
+        parts.append(f"STAN={result['stan']}")
+    return " ".join(parts)
+
+
+# ── Terminal state (tokens, transactions, keys) ───────────────────────────────
+
+class PairRateLimiter:
+    """Fixed-window limiter: per IP (pair request + confirm) and global (confirm only)."""
+
+    def __init__(self) -> None:
+        self.max = RATE_LIMIT_MAX
+        self.window = RATE_LIMIT_WINDOW_SEC
+        self.global_max = CONFIRM_GLOBAL_MAX
+        self._buckets: dict[str, list] = {}
+        self._global = [0, 0.0]
+        self._lock = threading.Lock()
+
+    def allow(self, ip: str) -> bool:
+        with self._lock:
+            now = time.time()
+            bucket = self._buckets.setdefault(ip, [0, now])
+            if now - bucket[1] >= self.window:
+                bucket[:] = [0, now]
+            if bucket[0] >= self.max:
+                return False
+            bucket[0] += 1
+            return True
+
+    def allow_global_confirm(self) -> bool:
+        with self._lock:
+            now = time.time()
+            if now - self._global[1] >= self.window:
+                self._global[:] = [0, now]
+            if self._global[0] >= self.global_max:
+                return False
+            self._global[0] += 1
+            return True
+
+
+class StateFileError(Exception):
+    """The state file exists but cannot be used; it is left untouched."""
+
+
+class TerminalState:
+    """
+    What the terminal keeps in Room + settings: paired POS tokens, transactions,
+    admin key and discovery key — persisted as one JSON file. Pairing sessions
+    live in memory (they expire after 120 s anyway).
+    """
+
+    def __init__(self, path: str, fresh: bool = False) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+        data = {} if fresh else self._load()
+        try:
+            self.admin_key: str = data.get("adminKey") or secrets.token_urlsafe(24)
+            self.discovery_key = bytes.fromhex(data.get("discoveryKey") or secrets.token_hex(32))
+            self.tokens: dict[str, dict] = dict(data.get("tokens", {}))
+            self.transactions: dict[str, dict] = dict(data.get("transactions", {}))
+            for tx in self.transactions.values():
+                tx["status"], tx.get("createdAt")
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            raise StateFileError(f"state file {path} has an unexpected shape ({e!r})") from None
+        self.sessions: dict[str, dict] = {}
+        self.limiter = PairRateLimiter()
+        self.last_pin: str | None = None    # test hook: the PIN shown on screen
+        reaped = self.reap_stuck_pending()
+        if reaped:
+            log.info(f"marked {reaped} stale pending transaction(s) as timeout")
+        self.save()
+
+    def _load(self) -> dict:
+        """Absent file → empty state. Anything unreadable is fatal: never overwrite keys and tokens."""
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise StateFileError(f"cannot read state file {self.path}: {e}") from None
+        if not isinstance(data, dict):
+            raise StateFileError(f"state file {self.path} is not a JSON object")
+        return data
+
+    def save(self) -> None:
+        with self.lock:
+            data = {"adminKey": self.admin_key, "discoveryKey": self.discovery_key.hex(),
+                    "tokens": self.tokens, "transactions": self.transactions}
+            write_private(self.path, json.dumps(data, indent=1))
+
+    def reap_stuck_pending(self, older_than: float = STALE_PENDING_SEC) -> int:
+        """A payment killed mid-flight must not wedge its ref at 409 forever."""
+        cutoff_ms = (time.time() - older_than) * 1000
+        n = 0
+        with self.lock:
+            for tx in self.transactions.values():
+                if tx["status"] == "pending" and tx.get("createdAt", 0) < cutoff_ms:
+                    tx["status"] = "timeout"
+                    n += 1
+        return n
+
+    def record(self, tx: dict) -> None:
+        with self.lock:
+            self.transactions[tx["ref"]] = tx
+            self.save()
+
+
+def completed_tx(ref: str, amount_cents: int, status: str, result: dict, req: dict | None,
+                 pos_id: str | None, created_at_ms: int) -> dict:
+    """TransactionRecorder.completed(): the row stored for a finished payment."""
+    req = req or {}
     return {
-        "status": outcome["status"],
-        "ref": ref,
-        "responseCode": outcome.get("responseCode"),
-        "authNumber": outcome.get("authNumber"),
-        "stan": outcome.get("stan"),
-        "rrn": outcome.get("rrn"),
-        "cardNumber": outcome.get("cardNumber"),
-        "cardScheme": outcome.get("cardScheme"),
-        "terminalId": terminal_id,
-        "merchantId": merchant_id,
-        "transactionDate": outcome.get("transactionDate"),
-        "transactionTime": outcome.get("transactionTime"),
-        "amountCents": amount_centimes,
+        "ref": ref, "status": status, "amountCents": amount_cents,
+        "cashierId": req.get("cashierId"), "tillId": req.get("tillId"),
+        "description": req.get("description"),
+        "responseCode": result.get("responseCode"), "authNumber": result.get("authNumber"),
+        "stan": result.get("stan"), "rrn": result.get("rrn"),
+        "cardNumber": result.get("cardNumber"), "cardScheme": result.get("cardScheme"),
+        "terminalId": result.get("terminalId"), "merchantId": result.get("merchantId"),
+        "txDate": result.get("transactionDate"), "txTime": result.get("transactionTime"),
+        "posId": pos_id, "createdAt": created_at_ms, "completedAt": int(time.time() * 1000),
     }
 
 
-# ── Pairing store (LAN) ─────────────────────────────────────────────────────
-TS_TOLERANCE_SEC = 30
-SESSION_TTL_SEC = 300
+def tx_response(tx: dict) -> dict:
+    """PayResult JSON returned by LAN /pay (TransactionEntity.toResponse)."""
+    return {
+        "status": tx["status"], "ref": tx["ref"], "responseCode": tx.get("responseCode"),
+        "authNumber": tx.get("authNumber"), "stan": tx.get("stan"), "rrn": tx.get("rrn"),
+        "cardNumber": tx.get("cardNumber"), "cardScheme": tx.get("cardScheme"),
+        "terminalId": tx.get("terminalId"), "merchantId": tx.get("merchantId"),
+        "transactionDate": tx.get("txDate"), "transactionTime": tx.get("txTime"),
+        "amountCents": tx["amountCents"],
+    }
 
 
-class PairError(Exception):
-    pass
+# ── LAN HTTP API ──────────────────────────────────────────────────────────────
+
+@dataclass
+class Reply:
+    status: int
+    body: dict | None = None     # None → empty body
+    detail: str = ""             # request summary for the log line
+    outcome: str = ""            # result summary for the log line
 
 
-class PairingStore:
-    """In-memory pairing sessions + issued POS tokens for the LAN terminal."""
+def err(status: int, message: str, detail: str = "") -> Reply:
+    return Reply(status, {"error": message}, detail, f"{status} {message}")
 
-    def __init__(self) -> None:
-        self._sessions: dict[str, dict] = {}
-        self._tokens: dict[str, dict] = {}
-        self._lock = threading.Lock()
 
-    def begin(self, pos_id: str, pos_label: str, client_pub_key: str | None = None) -> tuple[str, str]:
-        session_id = secrets.token_hex(16)
-        pin = f"{random.randint(0, 999999):06d}"
-        with self._lock:
-            self._sessions[session_id] = {
-                "pinHash": sha256_hex(pin.encode()),
-                "posId": pos_id, "posLabel": pos_label,
-                "clientPubKey": client_pub_key,
-                "exp": time.time() + SESSION_TTL_SEC,
-            }
-        return session_id, pin
+class LanApi:
+    """The terminal's Ktor routes, transport-free so they can be self-checked."""
 
-    def confirm(self, session_id: str, pin: str, pos_id: str, pos_label: str) -> dict:
-        with self._lock:
-            s = self._sessions.get(session_id)
-            if not s or s["exp"] < time.time():
-                raise PairError("invalid or expired session")
-            if not hmac.compare_digest(s["pinHash"], sha256_hex(pin.encode())):
-                raise PairError("wrong pin")
-            del self._sessions[session_id]
-            client_pub_key = s.get("clientPubKey")
-            token_secret = secrets.token_bytes(32)
-            token_id = secrets.token_hex(16)
-            token_hmac = hmac_hex(token_secret, token_id.encode())
-            self._tokens[token_id] = {
-                "tokenHmac": token_hmac, "posId": pos_id, "posLabel": pos_label,
-                "createdAt": datetime.now().isoformat(),
-            }
-        resp = {"tokenId": token_id, "posId": pos_id, "terminalModel": "P3"}
-        # #4b: if the POS sent an ephemeral RSA key, return the secret encrypted
-        # (never cleartext) — mirrors the real terminal. Legacy POS → cleartext.
-        if client_pub_key:
-            resp["encryptedTokenSecret"] = rsa_oaep_encrypt_b64(client_pub_key, token_secret)
-        else:
-            resp["tokenSecret"] = token_secret.hex()
-        return resp
+    def __init__(self, state: TerminalState, engine: OutcomeEngine, cfg: Config) -> None:
+        self.state = state
+        self.engine = engine
+        self.cfg = cfg
 
-    def verify(self, token_id: str, ts: str, method: str, path: str,
-               body: bytes, sig: str) -> tuple[bool, str | None]:
+    def handle(self, method: str, raw_path: str, headers, body: bytes, ip: str) -> Reply:
+        path = urllib.parse.urlsplit(raw_path).path
         try:
-            if abs(int(time.time()) - int(ts)) > TS_TOLERANCE_SEC:
-                return False, "timestamp out of window"
-        except ValueError:
-            return False, "bad timestamp"
-        tok = self._tokens.get(token_id)
-        if not tok:
-            return False, "unknown token"
-        expected = lan_expected_sig(tok["tokenHmac"], token_id, ts, method, path, body)
-        if not hmac.compare_digest(expected, sig):
-            return False, "invalid signature"
-        return True, None
+            route = self._route(method, path)
+            if route is None:
+                return Reply(404, None, "", "404 (no such route)")
+            fn, args = route
+            return fn(headers, body, ip, path, *args)
+        except Exception as e:      # StatusPages: any uncaught exception
+            log.debug(f"internal error: {e!r}")
+            return err(500, "internal error")
 
-    def list_pos(self) -> list[dict]:
-        with self._lock:
-            return [
-                {"tokenId": tid, "posId": t["posId"], "posLabel": t["posLabel"],
-                 "createdAt": t["createdAt"]}
-                for tid, t in self._tokens.items()
-            ]
+    def _route(self, method: str, path: str):
+        table = {
+            ("GET", "/health"): self.health,
+            ("POST", "/pay"): self.pay,
+            ("POST", "/reversal"): self.reversal,
+            ("GET", "/admin/pos"): self.list_pos,
+            ("POST", "/admin/reversal"): self.admin_reversal,
+            ("POST", "/pair/request"): self.pair_request,
+            ("POST", "/pair/confirm"): self.pair_confirm,
+        }
+        if (method, path) in table:
+            return table[(method, path)], ()
+        m = re.fullmatch(r"/admin/pos/([^/]+)", path)
+        if method == "DELETE" and m:
+            return self.revoke_pos, (urllib.parse.unquote(m.group(1)),)
+        return None
 
-    def revoke(self, token_id: str) -> bool:
-        with self._lock:
-            return self._tokens.pop(token_id, None) is not None
-# ── Shared context ──────────────────────────────────────────────────────────
-class EmulatorContext:
-    """Shared state + config across LAN and cloud halves."""
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, mode: str, error_code: str, terminal_id: str = "EMU-TID",
-                 merchant_id: str = "EMU-MID", serial: str = "EMU-SERIAL",
-                 debug: bool = False) -> None:
-        self.mode = mode
-        self.error_code = error_code
-        self.terminal_id = terminal_id
-        self.merchant_id = merchant_id
-        self.serial = serial
-        self.debug = debug
-        self.pairing = PairingStore()
-        self.pairing.last_pin = None  # test hook: last PIN printed
-        self._paid_refs: dict[str, dict] = {}   # ref -> PayResult (idempotency)
-        self._lock = threading.Lock()
+    def authenticate(self, headers, method: str, path: str, body: bytes) -> tuple[dict | None, Reply | None]:
+        """Verify OMNI-TOKEN; returns (token, None) or (None, 401 reply). Same check order as the terminal."""
+        header = headers.get("Authorization")
+        if header is None or not header.startswith("OMNI-TOKEN "):
+            return None, err(401, "missing or invalid Authorization")
+        parts = {}
+        for seg in header[len("OMNI-TOKEN "):].split(","):
+            kv = seg.strip().split("=", 1)
+            if len(kv) == 2:
+                parts[kv[0]] = kv[1]
+        token_id = parts.get("tokenId")
+        if token_id is None:
+            return None, err(401, "missing tokenId")
+        ts = parse_long(parts.get("ts"))
+        if ts is None:
+            return None, err(401, "missing ts")
+        sig = parts.get("sig")
+        if sig is None:
+            return None, err(401, "missing sig")
+        if abs(int(time.time()) - ts) > TS_TOLERANCE_SEC:
+            return None, err(401, "timestamp out of window")
+        token = self.state.tokens.get(token_id)
+        if token is None:
+            return None, err(401, "unknown token")
+        # The terminal signs the parsed Long, so "+0123" is verified as "123".
+        expected = lan_signature(token["tokenHmac"], token_id, str(ts), method, path, body)
+        if not hmac.compare_digest(expected.encode(), sig.encode()):
+            return None, err(401, "invalid signature")
+        return {**token, "tokenId": token_id}, None
 
-    def resolve_payment(self, ref: str, amount_centimes: int) -> dict:
-        with self._lock:
-            if ref in self._paid_refs:
-                return self._paid_refs[ref]
-        # compute outcome outside the lock (interactive prompt may block)
-        if self.mode == "interactive" and magic_outcome(amount_centimes) is None:
-            outcome = ask_operator(ref, amount_centimes, self.error_code)
-        else:
-            outcome = decide_outcome(amount_centimes, self.mode, self.error_code)
-        res = pay_result(ref, amount_centimes, outcome, self.terminal_id, self.merchant_id)
-        with self._lock:
-            # another thread may have resolved the same ref while we prompted
-            if ref in self._paid_refs:
-                return self._paid_refs[ref]
-            self._paid_refs[ref] = res
-            return res
+    @staticmethod
+    def receive_json(headers, body: bytes) -> dict:
+        """call.receive<Dto>() through ContentNegotiation: needs a JSON content type."""
+        ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            raise ValueError(f"unsupported content type {ctype!r}")
+        return LanApi.parse_json(body)
+
+    @staticmethod
+    def parse_json(body: bytes) -> dict:
+        req = json.loads(body.decode("utf-8"))
+        if not isinstance(req, dict):
+            raise ValueError("body is not an object")
+        return req
+
+    # ── Routes ────────────────────────────────────────────────────────────────
+
+    def health(self, headers, body, ip, path) -> Reply:
+        return Reply(200, {"status": "ok", "version": VERSION, "napsPay": "installed"})
+
+    def pair_request(self, headers, body, ip, path) -> Reply:
+        if not self.state.limiter.allow(ip):
+            return err(429, "rate limit exceeded")
+        req = self.receive_json(headers, body)
+        pos_id, pos_label = str_field(req, "posId"), str_field(req, "posLabel")
+        str_field(req, "clientNonce")
+        pub_key = str_field(req, "clientPubKey", required=False)
+        session_id = str(uuid.uuid4())
+        pin = f"{secrets.randbelow(10 ** PIN_DIGITS):0{PIN_DIGITS}d}"
+        with self.state.lock:
+            self.state.sessions[session_id] = {
+                # Salted with the sessionId, as on the terminal.
+                "pinHash": sha256_hex((session_id + pin).encode()),
+                "posId": pos_id, "posLabel": pos_label, "clientPubKey": pub_key,
+                "expiresAt": int(time.time()) + SESSION_TTL_SEC,
+                "failedAttempts": 0, "used": False,
+            }
+            self.state.last_pin = pin
+        say("\n" + boxed("PAIRING PIN", [
+            f"POS     : {pos_label} ({pos_id})",
+            f"PIN     : {pin}",
+            f"Expires : {SESSION_TTL_SEC} s",
+            "Encrypted secret" if pub_key else "Cleartext secret (no clientPubKey)",
+        ]) + "\n")
+        return Reply(200, {"sessionId": session_id, "expiresIn": SESSION_TTL_SEC},
+                     f"posId={pos_id}", f"200 session={session_id[:8]}")
+
+    def pair_confirm(self, headers, body, ip, path) -> Reply:
+        if not (self.state.limiter.allow(ip) and self.state.limiter.allow_global_confirm()):
+            return err(429, "rate limit exceeded")
+        req = self.receive_json(headers, body)
+        session_id, pin = str_field(req, "sessionId"), str_field(req, "pin")
+        detail = f"session={session_id[:8]}"
+        with self.state.lock:
+            s = self.state.sessions.get(session_id)
+            if s is None or s["used"] or s["expiresAt"] < int(time.time()):
+                return err(400, "invalid or expired session", detail)
+            if s["failedAttempts"] >= PIN_MAX_ATTEMPTS:
+                s["used"] = True
+                return err(400, "invalid or expired session", detail)
+            if not hmac.compare_digest(sha256_hex((session_id + pin).encode()), s["pinHash"]):
+                s["failedAttempts"] += 1
+                return err(400, "wrong pin", detail)
+            s["used"] = True
+
+            token_secret = secrets.token_bytes(32)
+            token_id = str(uuid.uuid4())
+            resp = {"tokenId": token_id, "posId": s["posId"], "terminalModel": self.cfg.model}
+            if s["clientPubKey"] is not None:
+                try:
+                    resp["encryptedTokenSecret"] = rsa_oaep_encrypt_b64(s["clientPubKey"], token_secret)
+                except Exception as e:
+                    log.debug(f"tokenSecret encryption failed: {e!r}")
+                    return err(400, "invalid clientPubKey", detail)
+            else:
+                resp["tokenSecret"] = token_secret.hex()
+            # posId/posLabel come from the session, never from this body.
+            self.state.tokens[token_id] = {
+                "tokenHmac": hmac_hex(token_secret, token_id.encode()),
+                "posId": s["posId"], "posLabel": s["posLabel"], "createdAt": int(time.time()),
+            }
+            self.state.save()
+        say(f"  ✔ Paired {s['posLabel']} ({s['posId']}) — tokenId {token_id}\n")
+        return Reply(200, resp, detail, f"200 paired posId={s['posId']} tokenId={token_id[:8]}")
+
+    def pay(self, headers, body, ip, path) -> Reply:
+        token, denied = self.authenticate(headers, "POST", path, body)
+        if denied:
+            return denied
+        req = self.parse_json(body)
+        ref, amount = str_field(req, "ref"), long_field(req, "amountCents")
+        for opt in ("cashierId", "tillId", "description"):
+            str_field(req, opt, required=False)
+        bool_field(req, "printReceipt")     # Gson throws before NapsPay is ever called
+        detail = f"ref={ref} amount={amount}"
+        now_ms = int(time.time() * 1000)
+
+        with self.state.lock:
+            cached = self.state.transactions.get(ref)
+            if cached is not None:
+                if cached["status"] in ("approved", "reversed"):
+                    return Reply(200, tx_response(cached), detail, f"cached {describe(cached)}")
+                if cached["status"] == "pending":
+                    return err(409, "ref already in progress", detail)
+                # timeout / declined / cancelled: no money moved → charge again, same ref
+                cached["status"], cached["createdAt"] = "pending", now_ms
+            else:
+                self.state.transactions[ref] = {
+                    "ref": ref, "status": "pending", "amountCents": amount,
+                    "cashierId": req.get("cashierId"), "tillId": req.get("tillId"),
+                    "description": req.get("description"), "posId": token["posId"], "createdAt": now_ms,
+                }
+            self.state.save()
+
+        result = self.engine.pay(ref, amount, source=f"{ip} ({token['posLabel']})")
+        tx = completed_tx(ref, amount, result["status"], result, req, token["posId"], now_ms)
+        self.state.record(tx)
+        return Reply(200, tx_response(tx), detail, describe(result))
+
+    def reversal(self, headers, body, ip, path) -> Reply:
+        token, denied = self.authenticate(headers, "POST", path, body)
+        if denied:
+            return denied
+        req = self.parse_json(body)
+        ref, original_ref, stan = str_field(req, "ref"), str_field(req, "originalRef"), str_field(req, "stan")
+        detail = f"ref={ref} originalRef={original_ref} stan={stan}"
+        original = self.state.transactions.get(original_ref)
+        # A POS may only reverse its own sale, with the matching STAN.
+        if original is None or original.get("posId") != token["posId"] or original.get("stan") != stan:
+            return err(403, "not authorized to reverse this transaction", detail)
+        result = self.engine.reversal(ref, stan)
+        status = "reversed" if result["status"] == "approved" else "declined"
+        return Reply(200, {"status": status, "ref": ref, "responseCode": result.get("responseCode")},
+                     detail, f"{status}" + (f" RC={result['responseCode']}" if result.get("responseCode") else ""))
+
+    def admin_reversal(self, headers, body, ip, path) -> Reply:
+        key = headers.get("X-Admin-Key")
+        if key is None or not hmac.compare_digest(key.encode(), self.state.admin_key.encode()):
+            return err(401, "invalid admin key")
+        req = self.parse_json(body)
+        original_ref, reversal_ref = str_field(req, "originalRef"), str_field(req, "reversalRef")
+        detail = f"originalRef={original_ref} reversalRef={reversal_ref}"
+        with self.state.lock:
+            original = self.state.transactions.get(original_ref)
+            if original is None:
+                return err(404, "transaction not found", detail)
+            if original["status"] == "pending":
+                original["status"] = "cancelled"
+                self.state.save()
+                return Reply(200, {"status": "cancelled", "ref": original_ref, "note": "pending cleared locally"},
+                             detail, "cancelled (pending cleared locally)")
+            stan = original.get("stan")
+        if stan is None:
+            return err(422, "no STAN on record — cannot reverse", detail)
+        result = self.engine.reversal(reversal_ref, stan)
+        status = "reversed" if result["status"] == "approved" else "declined"
+        return Reply(200, {"status": status, "ref": reversal_ref, "responseCode": result.get("responseCode")},
+                     detail, status)
+
+    def list_pos(self, headers, body, ip, path) -> Reply:
+        token, denied = self.authenticate(headers, "GET", path, b"")
+        if denied:
+            return denied
+        # Each POS only ever sees itself.
+        return Reply(200, {"pos": [{"tokenId": token["tokenId"], "posId": token["posId"],
+                                    "posLabel": token["posLabel"], "createdAt": token["createdAt"]}]},
+                     f"posId={token['posId']}", "200")
+
+    def revoke_pos(self, headers, body, ip, path, token_id: str) -> Reply:
+        caller, denied = self.authenticate(headers, "DELETE", path, b"")
+        if denied:
+            return denied
+        if token_id != caller["tokenId"]:
+            return err(403, "forbidden", f"tokenId={token_id}")
+        with self.state.lock:
+            if self.state.tokens.pop(token_id, None) is None:
+                return err(404, "token not found", f"tokenId={token_id}")
+            self.state.save()
+        return Reply(204, None, f"tokenId={token_id}", "204 revoked")
 
 
-# ── LAN HTTP server ─────────────────────────────────────────────────────────
-def make_lan_server(host: str, port: int, ctx: EmulatorContext) -> ThreadingHTTPServer:
+def make_http_server(host: str, port: int, api: LanApi) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, *a):
-            if ctx.debug:
-                super().log_message(*a)
+        def version_string(self) -> str:
+            return "Ktor/emulated"
 
-        def _send(self, code: int, obj: dict | None):
-            payload = json.dumps(obj).encode() if obj is not None else b""
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+        def log_message(self, *a) -> None:
+            pass    # one line per request is logged by _dispatch
+
+        def _read_body(self) -> bytes:
+            """Content-Length or chunked framing; raises ValueError on malformed framing."""
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                body = b""
+                while True:
+                    size_line = self.rfile.readline(1024)
+                    if not size_line.endswith(b"\n"):
+                        raise ValueError("truncated chunk size")
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                    if size == 0:
+                        break
+                    chunk = self.rfile.read(size)
+                    if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                        raise ValueError("truncated chunk")
+                    body += chunk
+                while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                    pass    # trailers
+                return body
+            length = self.headers.get("Content-Length")
+            if length is None:
+                return b""
+            if not re.fullmatch(r"[0-9]+", length.strip()):
+                raise ValueError(f"invalid Content-Length {length!r}")
+            n = int(length)
+            body = self.rfile.read(n)
+            if len(body) != n:
+                raise ValueError("body shorter than Content-Length")
+            return body
+
+        def _dispatch(self) -> None:
+            ip = self.client_address[0]
+            try:
+                body = self._read_body()
+            except ValueError as e:
+                # Framing is unknown past this point: answer like the catch-all and close.
+                log.debug(f"[{ip}] bad request framing: {e}")
+                body, reply = b"", err(500, "internal error")
+                self.close_connection = True
+            else:
+                reply = api.handle(self.command, self.path, self.headers, body, ip)
+
+            payload = gson_bytes(reply.body) if reply.body is not None else b""
+            self.send_response(reply.status)
+            if reply.body is not None:
+                self.send_header("Content-Type", "application/json; charset=UTF-8")
             self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             if payload:
                 self.wfile.write(payload)
 
-        def _read_body(self) -> bytes:
-            n = int(self.headers.get("Content-Length", 0))
-            return self.rfile.read(n) if n else b""
+            path = urllib.parse.urlsplit(self.path).path
+            detail = f" {reply.detail}" if reply.detail else ""
+            log.info(f"[{ip}] {self.command} {path}{detail} → {reply.outcome or reply.status}")
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(f"[{ip}]   request : {body.decode('utf-8', 'replace') or '(empty)'}")
+                log.debug(f"[{ip}]   response: {payload.decode('utf-8', 'replace') or '(empty)'}")
 
-        def _auth(self, body: bytes) -> tuple[str | None, str | None]:
-            h = self.headers.get("Authorization", "")
-            if not h.startswith("OMNI-TOKEN "):
-                return None, "missing Authorization"
-            try:
-                parts = dict(p.split("=", 1) for p in h[len("OMNI-TOKEN "):].split(","))
-            except ValueError:
-                return None, "malformed Authorization"
-            ok, err = ctx.pairing.verify(parts.get("tokenId", ""), parts.get("ts", ""),
-                                         self.command, self.path, body, parts.get("sig", ""))
-            return (parts["tokenId"], None) if ok else (None, err)
+        do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _dispatch
 
-        def _json_body(self, body: bytes):
-            try:
-                return json.loads(body or b"{}"), None
-            except (json.JSONDecodeError, ValueError):
-                return None, "invalid JSON"
-
-        def do_GET(self):
-            if self.path == "/health":
-                return self._send(200, {"status": "ok", "version": "1.0.12", "napsPay": "installed"})
-            if self.path == "/admin/pos":
-                _, err = self._auth(b"")
-                if err:
-                    return self._send(401, {"error": err})
-                return self._send(200, {"pos": ctx.pairing.list_pos()})
-            self._send(404, {"error": "not found"})
-
-        def do_DELETE(self):
-            if self.path.startswith("/admin/pos/"):
-                _, err = self._auth(b"")
-                if err:
-                    return self._send(401, {"error": err})
-                token_id = self.path.rsplit("/", 1)[-1]
-                ctx.pairing.revoke(token_id)
-                return self._send(204, None)
-            self._send(404, {"error": "not found"})
-
-        def do_POST(self):
-            body = self._read_body()
-            if self.path == "/pair/request":
-                req, jerr = self._json_body(body)
-                if jerr:
-                    return self._send(400, {"error": jerr})
-                sid, pin = ctx.pairing.begin(
-                    req.get("posId", ""), req.get("posLabel", ""), req.get("clientPubKey"),
-                )
-                ctx.pairing.last_pin = pin
-                print(f"[LAN pair] PIN for '{req.get('posLabel','')}': {pin}  (type this into your app)")
-                return self._send(200, {"sessionId": sid, "expiresIn": SESSION_TTL_SEC})
-            if self.path == "/pair/confirm":
-                req, jerr = self._json_body(body)
-                if jerr:
-                    return self._send(400, {"error": jerr})
-                try:
-                    tok = ctx.pairing.confirm(req["sessionId"], req["pin"],
-                                              req.get("posId", ""), req.get("posLabel", ""))
-                    return self._send(200, tok)
-                except (PairError, KeyError) as ex:
-                    return self._send(400, {"error": str(ex) or "invalid or expired session"})
-            if self.path in ("/pay", "/reversal"):
-                _, err = self._auth(body)
-                if err:
-                    return self._send(401, {"error": err})
-                req, jerr = self._json_body(body)
-                if jerr:
-                    return self._send(400, {"error": jerr})
-                if self.path == "/reversal":
-                    return self._send(200, {
-                        "status": "reversed", "ref": req.get("ref"),
-                        "responseCode": "000", "stan": req.get("stan"),
-                    })
-                res = ctx.resolve_payment(req["ref"], int(req["amountCents"]))
-                return self._send(200, res)
-            self._send(404, {"error": "not found"})
-
-    return ThreadingHTTPServer((host, port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    return server
 
 
-# ── UDP discovery ───────────────────────────────────────────────────────────
-def run_udp_discovery(host: str, port: int, ctx: EmulatorContext, stop: threading.Event) -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
+# ── UDP discovery ─────────────────────────────────────────────────────────────
+
+def discovery_reply(state: TerminalState, cfg: Config, nonce: str) -> bytes:
+    return gson_bytes({"device": cfg.serial, "model": cfg.model, "version": VERSION,
+                       "hmac": hmac_hex(state.discovery_key, nonce.encode())})
+
+
+def run_discovery(sock: socket.socket, state: TerminalState, cfg: Config, stop: threading.Event) -> None:
     sock.settimeout(0.5)
-    reply = json.dumps({"device": ctx.serial, "model": "P3",
-                        "version": "1.0.12", "hmac": "emulated"}).encode()
     while not stop.is_set():
         try:
-            data, addr = sock.recvfrom(1024)
+            data, addr = sock.recvfrom(256)
         except socket.timeout:
             continue
-        if data.startswith(b"OMNI-DISC:"):
-            sock.sendto(reply, addr)
-    sock.close()
+        except OSError:
+            break
+        msg = data.decode("utf-8", "replace")
+        if msg.startswith(DISCOVERY_PREFIX):
+            nonce = msg[len(DISCOVERY_PREFIX):].strip()
+            try:
+                sock.sendto(discovery_reply(state, cfg, nonce), addr)
+                log.info(f"[{addr[0]}] UDP {DISCOVERY_PREFIX} nonce={nonce[:16]} → identity")
+            except OSError as e:
+                log.warning(f"[{addr[0]}] discovery reply failed: {e}")
 
 
-# ── Cloud: token persistence ────────────────────────────────────────────────
-DEFAULT_TOKEN_FILE = os.path.expanduser("~/.aslan-omni-emulator/device.json")
+def run_beacon(cfg: Config, port: int, stop: threading.Event) -> None:
+    msg = (BEACON_PREFIX + gson_bytes({"device": cfg.serial, "model": cfg.model,
+                                       "version": VERSION}).decode()).encode()
+    while not stop.is_set():
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(msg, ("255.255.255.255", port))
+        except OSError as e:
+            log.debug(f"beacon send failed: {e}")
+        stop.wait(BEACON_INTERVAL_SEC)
+
+
+# ── Emulator (LAN half) ───────────────────────────────────────────────────────
+
+class Emulator:
+    """State + outcome engine, plus (unless cfg.lan is False) the HTTP and UDP listeners."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.state = TerminalState(cfg.state_file, fresh=cfg.fresh)
+        self.engine = OutcomeEngine(cfg)
+        self.api = LanApi(self.state, self.engine, cfg)
+        self.stop_event = threading.Event()
+        self.http: ThreadingHTTPServer | None = None
+        self.udp: socket.socket | None = None
+        self.lan_port = cfg.lan_port
+        self.udp_port = cfg.udp_port
+
+    def start(self) -> None:
+        if not self.cfg.lan:
+            return
+        self.http = make_http_server(self.cfg.host, self.cfg.lan_port, self.api)
+        self.lan_port = self.http.server_address[1]
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.udp.bind((self.cfg.host, self.cfg.udp_port))
+        self.udp_port = self.udp.getsockname()[1]
+        threading.Thread(target=self.http.serve_forever, args=(0.1,), daemon=True).start()
+        threading.Thread(target=run_discovery, args=(self.udp, self.state, self.cfg, self.stop_event),
+                         daemon=True).start()
+        if self.cfg.beacon:
+            threading.Thread(target=run_beacon, args=(self.cfg, self.udp_port, self.stop_event),
+                             daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.http:
+            self.http.shutdown()
+            self.http.server_close()
+        if self.udp:
+            self.udp.close()
+
+
+# ── Cloud device: token acquisition ───────────────────────────────────────────
+
+def api_root(base: str) -> str:
+    """Requests go to BASE/omni/...; nginx strips /omni, so signatures cover the bare path."""
+    base = base.rstrip("/")
+    return base if base.endswith("/omni") else base + "/omni"
+
+
+def _cloud_json(root: str, method: str, path: str, body_obj: dict | None = None) -> dict:
+    """Unauthenticated cloud call (claim, claim status, demo token)."""
+    body = json.dumps(body_obj, separators=(",", ":")).encode() if body_obj is not None else None
+    headers = {"User-Agent": USER_AGENT}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(root + path, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read() or b"{}")
 
 
 def save_device_token(path: str, rec: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh)
+    write_private(path, json.dumps(rec))
 
 
-def load_device_token(path: str, cloud_base: str) -> dict | None:
+def load_device_token(path: str, base: str) -> dict | None:
     try:
         with open(path, encoding="utf-8") as fh:
             rec = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
-    return rec if rec.get("cloudBase") == cloud_base else None
+    cached = rec.get("cloudBase")
+    return rec if rec.get("deviceToken") and cached and api_root(cached) == api_root(base) else None
 
 
 def reset_device_token(path: str) -> bool:
@@ -479,335 +1189,495 @@ def reset_device_token(path: str) -> bool:
         return False
 
 
-# ── Cloud: HTTP with device signing ─────────────────────────────────────────
-# A browser-like User-Agent — Cloudflare (which fronts staging/prod) blocks the
-# default "Python-urllib/x.y" UA with a 403 (error 1010).
-USER_AGENT = "AslanOmniEmulator/1.0 (device)"
+def fetch_demo_token(root: str) -> dict | None:
+    """Shared staging demo terminal; None if the server has none configured (404) or on error."""
+    try:
+        rec = _cloud_json(root, "GET", "/devices/demo-token")
+        return rec if rec.get("deviceToken") else None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            log.warning(f"[cloud] demo-token fetch failed: HTTP {e.code}")
+    except Exception as e:
+        log.warning(f"[cloud] demo-token fetch failed: {e}")
+    return None
 
 
-def cloud_request(base: str, method: str, path: str, device_token: str,
-                  body_obj: dict | None = None, stream: bool = False):
-    # Serialize compactly (no spaces) so the bytes we sign match what the API
-    # hashes: it computes sha256(JSON.stringify(body)), and JS JSON.stringify emits
-    # no spaces. Python's default json.dumps adds ", "/": " spaces → signature
-    # mismatch (401 "Invalid signature") on any request with a JSON body.
-    body = json.dumps(body_obj, separators=(",", ":")).encode() if body_obj is not None else b""
-    headers = {
-        "Authorization": device_auth_header(device_token, method, path, body),
-        "User-Agent": USER_AGENT,
-    }
-    if body:
-        headers["Content-Type"] = "application/json"
-    if stream:
-        headers["Accept"] = "text/event-stream"
-    req = urllib.request.Request(base + path, data=(body or None), method=method, headers=headers)
-    return urllib.request.urlopen(req, timeout=None if stream else 30)
-
-
-# ── Cloud: SSE line streaming ───────────────────────────────────────────────
-def sse_lines(resp):
-    """Yield SSE lines from an HTTP response as they arrive.
-
-    urllib's buffered readline() does not deliver SSE lines in real time (it can
-    block waiting to fill its buffer), so we read raw chunks off the socket via
-    read1() and split on newlines ourselves. Each yielded item is one decoded
-    line with its trailing CR/LF stripped.
-    """
-    buf = b""
+def claim_device(root: str, cfg: Config, poll_sec: float = CLAIM_POLL_SEC) -> dict:
+    """Claim flow: POST /devices/claim, show the URL, poll status until activated."""
     while True:
-        chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1)
-        if not chunk:
-            break
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            yield line.decode("utf-8", "replace").rstrip("\r")
+        resp = _cloud_json(root, "POST", "/devices/claim",
+                           {"serialNumber": cfg.serial, "model": cfg.model, "appVersion": VERSION})
+        claim_url = resp.get("claimUrl", "")
+        claim_uuid = resp.get("uuid") or claim_url.rsplit("/", 1)[-1]
+        say("\n" + boxed("ACTIVATE THIS DEVICE", [f"Open : {claim_url}",
+                                                  "Then activate it in the dashboard."]) + "\n")
+        log.info("[cloud] waiting for activation…")
+        while True:
+            time.sleep(poll_sec)
+            try:
+                status = _cloud_json(root, "GET", f"/devices/claim/{claim_uuid}/status")
+            except urllib.error.HTTPError as e:
+                if e.code in (404, 410):
+                    log.warning("[cloud] claim expired — starting a new claim")
+                    break
+                continue
+            except Exception:
+                continue    # network hiccup: keep polling
+            if status.get("status") == "activated":
+                if status.get("deviceToken"):
+                    log.info("[cloud] activated")
+                    return status
+                log.warning("[cloud] activated without a token (already delivered?) — starting a new claim")
+                break
 
 
-# ── Cloud: SSE parsing ──────────────────────────────────────────────────────
-def parse_sse(lines):
-    """Yield (event, data_obj) tuples from an iterator of decoded SSE lines."""
-    event, data = None, None
-    for line in lines:
-        if line == "":
-            if event is not None and data is not None:
-                try:
-                    yield event, json.loads(data)
-                except json.JSONDecodeError:
-                    pass
-            event, data = None, None
-        elif line.startswith("event:"):
-            event = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data = line[len("data:"):].strip()
-
-
-# ── Cloud: result payloads ──────────────────────────────────────────────────
-def result_payload_for_pay(outcome: dict) -> dict:
-    # The API's resultSchema fields are z.string().optional() — NOT nullable — so
-    # posting explicit nulls (as a declined outcome would, having no auth/stan/card)
-    # fails validation with 400. Omit absent fields instead of sending null.
-    payload = {
-        "status": outcome["status"],
-        "responseCode": outcome.get("responseCode"),
-        "authNumber": outcome.get("authNumber"),
-        "stan": outcome.get("stan"),
-        "rrn": outcome.get("rrn"),
-        "cardNumber": outcome.get("cardNumber"),
-        "cardScheme": outcome.get("cardScheme"),
-        "txDate": outcome.get("transactionDate"),
-        "txTime": outcome.get("transactionTime"),
-    }
-    return {k: v for k, v in payload.items() if v is not None}
-
-
-def result_payload_for_reverse(stan: str) -> dict:
-    return {"status": "reversed", "responseCode": "000", "stan": stan}
-
-
-# ── Cloud: claim + relay loop ───────────────────────────────────────────────
-def acquire_device_token(base: str, token_file: str, explicit: str | None,
-                         save: bool, serial: str) -> dict:
+def acquire_device_token(base: str, cfg: Config, token_file: str, explicit: str | None = None,
+                         save: bool = False, poll_sec: float = CLAIM_POLL_SEC) -> str:
+    """explicit --device-token → cached file → shared demo terminal → claim flow."""
+    root = api_root(base)
     if explicit:
-        rec = {"deviceToken": explicit, "deviceId": None, "merchantId": None,
-               "merchantName": None, "cloudBase": base}
         if save:
-            save_device_token(token_file, rec)
-        return rec
+            save_device_token(token_file, {"deviceToken": explicit, "cloudBase": base})
+        return explicit
     cached = load_device_token(token_file, base)
     if cached:
-        print(f"[Cloud] using cached device token from {token_file}")
-        return cached
-    # No explicit or cached token: try the shared demo terminal. This lets a
-    # customer run the emulator against staging with zero setup. The endpoint is
-    # inert unless the server has a demo device configured (404 → fall through to
-    # the manual claim flow).
-    demo = fetch_demo_token(base)
+        log.info(f"[cloud] using cached device token from {token_file}")
+        return cached["deviceToken"]
+    demo = fetch_demo_token(root)
     if demo:
-        rec = {"deviceToken": demo["deviceToken"], "deviceId": None,
-               "merchantId": demo.get("merchantId"),
-               "merchantName": demo.get("merchantName"), "cloudBase": base}
-        save_device_token(token_file, rec)
-        print(f"[Cloud] using shared demo terminal ({demo.get('merchantName')}) — token cached.")
-        return rec
-    print("[Cloud] no device token — starting claim…")
-    resp = _cloud_json(base, "POST", "/devices/claim",
-                       {"serial": serial, "model": "P3", "appVersion": "emulator"})
-    uuid, claim_url = resp["uuid"], resp["claimUrl"]
-    print(f"[Cloud] Activate this device: {claim_url}\n[Cloud] waiting for activation…")
+        save_device_token(token_file, {"deviceToken": demo["deviceToken"], "merchantId": demo.get("merchantId"),
+                                       "merchantName": demo.get("merchantName"), "cloudBase": base})
+        log.info(f"[cloud] using shared demo terminal ({demo.get('merchantName')}) — token cached")
+        return demo["deviceToken"]
+    log.info("[cloud] no device token — starting claim")
+    status = claim_device(root, cfg, poll_sec)
+    save_device_token(token_file, {"deviceToken": status["deviceToken"], "merchantId": status.get("merchantId"),
+                                   "merchantName": status.get("merchantName"), "cloudBase": base})
+    return status["deviceToken"]
+
+
+# ── Cloud device: SSE relay ───────────────────────────────────────────────────
+
+def sse_events(resp):
+    """
+    Yield (event, data) from an SSE response as bytes arrive. read1() is used
+    because buffered readline() can hold lines back waiting to fill its buffer.
+    """
+    buf, event, data = b"", None, []
     while True:
-        time.sleep(3)
-        status = _cloud_json(base, "GET", f"/devices/claim/{uuid}/status", None)
-        if status.get("status") == "activated" and status.get("deviceToken"):
-            rec = {"deviceToken": status["deviceToken"], "deviceId": None,
-                   "merchantId": status.get("merchantId"),
-                   "merchantName": status.get("merchantName"), "cloudBase": base}
-            save_device_token(token_file, rec)
-            print("[Cloud] activated — token cached.")
-            return rec
-
-
-def fetch_demo_token(base: str) -> dict | None:
-    """Fetch the shared demo terminal's device token from the public endpoint.
-    Returns None if the server has no demo device configured (404) or on error —
-    callers fall back to the manual claim flow."""
-    try:
-        return _cloud_json(base, "GET", "/devices/demo-token", None)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        print(f"[Cloud] demo-token fetch failed: HTTP {e.code}")
-        return None
-    except Exception as e:
-        print(f"[Cloud] demo-token fetch failed: {e}")
-        return None
-
-
-def _cloud_json(base: str, method: str, path: str, body_obj: dict | None) -> dict:
-    """Unauthenticated cloud call (claim/status are not device-authed)."""
-    body = json.dumps(body_obj).encode() if body_obj is not None else None
-    headers = {"User-Agent": USER_AGENT}
-    if body:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(base + path, data=body, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read() or b"{}")
-
-
-def run_cloud_relay(base: str, ctx: EmulatorContext, device_token: str,
-                    stop: threading.Event) -> None:
-    backoff = 3
-    while not stop.is_set():
-        try:
-            code = cloud_request(base, "POST", "/cloud/pair/initiate", device_token, {})
-            code_obj = json.loads(code.read())
-            print(f"[Cloud] pairing code: {code_obj.get('pairingCode')}  (enter via pairCloud)")
-            resp = cloud_request(base, "GET", "/cloud/stream", device_token, stream=True)
-            print("[Cloud] SSE connected.")
-            backoff = 3
-            for event, data in parse_sse(sse_lines(resp)):
-                if stop.is_set():
-                    break
-                # Handle each command in its own thread so the SSE reader never
-                # blocks on the outbound result POST — it must keep consuming the
-                # stream (and acking Pings) to stay registered on the server, or
-                # the connection goes stale and later commands aren't delivered.
-                threading.Thread(
-                    target=_handle_cloud_event,
-                    args=(base, ctx, device_token, event, data),
-                    daemon=True,
-                ).start()
-        except Exception as ex:  # noqa: BLE001
-            print(f"[Cloud] disconnected: {ex}; retrying in {backoff}s")
-            if stop.wait(backoff):
-                break
-            backoff = min(backoff * 2, 60)
-
-
-def _handle_cloud_event(base: str, ctx: EmulatorContext, device_token: str,
-                        event: str, data: dict) -> None:
-    if event == "PayCommand":
-        amount = int(data["amountCents"])
-        if ctx.mode == "interactive" and magic_outcome(amount) is None:
-            outcome = ask_operator(data.get("ref", ""), amount, ctx.error_code)
-        else:
-            outcome = decide_outcome(amount, ctx.mode, ctx.error_code)
-        if outcome["status"] == "timeout":
-            print(f"[Cloud] PayCommand {data['commandId']} → timeout (not posting; long-poll expires)")
+        chunk = resp.read1(4096)
+        if not chunk:
             return
-        cloud_request(base, "POST", f"/cloud/pay/{data['commandId']}/result",
-                      device_token, result_payload_for_pay(outcome)).read()
-        print(f"[Cloud] PayCommand {data['commandId']} → {outcome['status']}")
-    elif event == "ReverseCommand":
-        cloud_request(base, "POST", f"/cloud/pay/{data['commandId']}/result",
-                      device_token, result_payload_for_reverse(data.get("stan", ""))).read()
-        print(f"[Cloud] ReverseCommand {data['commandId']} → reversed")
-    elif event == "Ping":
-        try:
-            cloud_request(base, "POST", "/cloud/ping", device_token, {}).read()
-        except Exception:  # noqa: BLE001
-            pass
-    elif event == "PairingRevoked":
-        print("[Cloud] pairing revoked by server")
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            line = raw.decode("utf-8", "replace").rstrip("\r")
+            if line == "":
+                if data:
+                    yield event or "message", "\n".join(data)
+                event, data = None, []
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data.append(line[5:].lstrip(" "))
 
 
-# ── Interactive operator prompt ─────────────────────────────────────────────
-_stdin_q: "queue.Queue[str]" = queue.Queue()
-_stdin_started = False
+def result_payload(result: dict, is_reversal: bool) -> dict:
+    """Body of POST /cloud/pay/{commandId}/result (CloudSyncManager.resultPayload)."""
+    s = result["status"]
+    status = ("reversed" if is_reversal else "approved") if s == "approved" else s
+    keys = [("responseCode", "responseCode"), ("authNumber", "authNumber"), ("stan", "stan"),
+            ("rrn", "rrn"), ("cardNumber", "cardNumber"), ("cardScheme", "cardScheme"),
+            ("txDate", "transactionDate"), ("txTime", "transactionTime"),
+            ("acquirerMerchantId", "merchantId"), ("acquirerTerminalId", "terminalId"),
+            ("transactionNumber", "transactionNumber")]
+    out = {"status": status}
+    out.update({k: result[src] for k, src in keys if result.get(src) is not None})
+    return out
 
 
-def _start_stdin_reader() -> None:
-    global _stdin_started
-    if _stdin_started:
-        return
-    _stdin_started = True
+def stored_result(tx: dict) -> dict:
+    """Rebuild a NapsPay result from a stored row so a re-delivered PayCommand is re-acked, not re-charged."""
+    if tx["status"] in ("approved", "reversed"):
+        status = "approved"
+    elif tx["status"] == "cancelled":
+        status = "cancelled"
+    else:   # PayResult.isTimeout ⇔ no response code
+        status = "declined" if tx.get("responseCode") is not None else "timeout"
+    return {"status": status, "responseCode": tx.get("responseCode"), "authNumber": tx.get("authNumber"),
+            "stan": tx.get("stan"), "rrn": tx.get("rrn"), "cardNumber": tx.get("cardNumber"),
+            "cardScheme": tx.get("cardScheme"), "terminalId": tx.get("terminalId"),
+            "merchantId": tx.get("merchantId"), "transactionDate": tx.get("txDate"),
+            "transactionTime": tx.get("txTime")}
 
-    def _reader():
-        while True:
+
+class CloudDevice:
+    """The terminal's CloudSyncManager: SSE in, signed result posts out."""
+
+    def __init__(self, base: str, device_token: str, emu: Emulator,
+                 backoff_base: float = SSE_BACKOFF_BASE_SEC, backoff_max: float = SSE_BACKOFF_MAX_SEC) -> None:
+        self.base = base
+        self.root = api_root(base)
+        self.token = device_token
+        self.emu = emu
+        self.backoff_base = backoff_base
+        self.backoff_max = backoff_max
+        self.stop_event = threading.Event()
+        self.connected = threading.Event()
+        self.pairing_code: str | None = None
+        self._resp = None
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
+        self._claims: dict[str, threading.Event] = {}   # ref → set when its payment is recorded
+        self._claims_lock = threading.Lock()
+
+    def request(self, method: str, path: str, body: bytes | None = None, stream: bool = False):
+        headers = {"Authorization": device_auth_header(self.token, method, path, body or b""),
+                   "User-Agent": USER_AGENT}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if stream:
+            headers["Accept"] = "text/event-stream"
+        req = urllib.request.Request(self.root + path, data=body, method=method, headers=headers)
+        return urllib.request.urlopen(req, timeout=None if stream else 30)
+
+    def _spawn(self, target, *args) -> None:
+        """Run a handler on a tracked worker thread; refused once stop() has begun."""
+        def work():
             try:
-                _stdin_q.put(input().strip().lower())
-            except EOFError:
-                _stdin_q.put("a")
+                target(*args)
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
+
+        with self._workers_lock:
+            if self.stop_event.is_set():
                 return
-    threading.Thread(target=_reader, daemon=True).start()
+            t = threading.Thread(target=work, daemon=True)
+            self._workers.add(t)
+            t.start()
 
+    def start(self) -> None:
+        self._spawn(self.initiate_pairing)
+        self._spawn(self._run)
 
-_ask_lock = threading.Lock()
-
-
-def ask_operator(ref: str, amount_centimes: int, error_code: str) -> dict:
-    """Prompt to approve or pick a decline scenario. Auto-approve after 120s."""
-    _start_stdin_reader()
-    scenarios = list(SCENARIOS.items())
-    with _ask_lock:
-        print(f"\n  ┌── Payment  ref={ref}  {amount_centimes/100:.2f} MAD ──")
-        print("  │  [a] Approve")
-        for i, (name, code) in enumerate(scenarios, 1):
-            print(f"  │  [{i:2d}] Decline — {name} ({code})")
-        print("  └── Choice → ", end="", flush=True)
+    def stop(self, join_timeout: float = 5.0) -> None:
+        """Like CloudSyncManager.stop(): cancel the stream and every in-flight handler."""
+        with self._workers_lock:
+            self.stop_event.set()
+            workers = list(self._workers)
+        # close() would block on the reader thread's buffer lock; shutting the
+        # socket down makes the blocked read1() return instead.
         try:
-            choice = _stdin_q.get(timeout=120)
-        except queue.Empty:
-            print("(timeout → approve)")
-            return decide_outcome(amount_centimes, "approve", error_code)
-    if choice in ("", "a"):
-        return decide_outcome(amount_centimes, "approve", error_code)
-    if choice.isdigit() and 1 <= int(choice) <= len(scenarios):
-        return {"status": "declined", "responseCode": scenarios[int(choice) - 1][1]}
-    return {"status": "declined", "responseCode": resolve_code(choice)}
+            self._resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        deadline = time.monotonic() + join_timeout
+        for t in workers:
+            if t is not threading.current_thread():
+                t.join(max(0.0, deadline - time.monotonic()))
+
+    def initiate_pairing(self) -> None:
+        """POST /cloud/pair/initiate — a code the POS enters in pairCloud()."""
+        try:
+            with self.request("POST", "/cloud/pair/initiate", b"{}") as r:
+                obj = json.loads(r.read() or b"{}")
+        except Exception as e:
+            log.warning(f"[cloud] pair/initiate failed: {e}")
+            return
+        self.pairing_code = obj.get("pairingCode")
+        say("\n" + boxed("CLOUD PAIRING CODE", [
+            f"Code    : {self.pairing_code}",
+            f"Expires : {obj.get('expiresInSeconds', 120)} s",
+            "Enter it in your app's pairCloud(); type p + Enter for a new one.",
+        ]) + "\n")
+
+    def _run(self) -> None:
+        backoff = self.backoff_base
+        while not self.stop_event.is_set():
+            try:
+                self._resp = self.request("GET", "/cloud/stream", stream=True)
+                log.info("[cloud] SSE connected")
+                backoff = self.backoff_base
+                self.connected.set()
+                self._spawn(self.fetch_pending)
+                for event, data in sse_events(self._resp):
+                    if self.stop_event.is_set():
+                        break
+                    # Own thread per event: the reader must keep draining the stream (and Pings).
+                    self._spawn(self._dispatch, event, data)
+                log.warning("[cloud] SSE stream closed")
+            except Exception as e:
+                if self.stop_event.is_set():
+                    break
+                log.warning(f"[cloud] SSE disconnected: {e}")
+            finally:
+                self.connected.clear()
+            if self.stop_event.wait(backoff):
+                break
+            log.info(f"[cloud] reconnecting (backoff {backoff:g} s)")
+            backoff = min(backoff * 2, self.backoff_max)
+
+    def _dispatch(self, event: str, data: str) -> None:
+        try:
+            if event == "PayCommand":
+                self.handle_pay(json.loads(data))
+            elif event == "ReverseCommand":
+                self.handle_reverse(json.loads(data))
+            elif event == "Ping":
+                self.ack_ping()
+            elif event == "BrandingUpdated":
+                log.info("[cloud] BrandingUpdated (logos not emulated)")
+            elif event == "PairingRevoked":
+                log.info("[cloud] PairingRevoked — a POS pairing was revoked")
+        except json.JSONDecodeError:
+            log.warning(f"[cloud] malformed {event}: {data[:80]}")
+        except Cancelled:
+            log.info(f"[cloud] {event} abandoned: emulator stopping")
+        except Exception as e:
+            log.warning(f"[cloud] {event} handling failed: {e!r}")
+
+    def fetch_pending(self) -> None:
+        """On (re)connect: a PayCommand queued while we were offline."""
+        try:
+            with self.request("GET", "/cloud/commands/pending") as r:
+                obj = json.loads(r.read() or b"{}")
+        except Exception as e:
+            log.warning(f"[cloud] fetch pending failed: {e}")
+            return
+        if isinstance(obj.get("command"), dict):
+            self.handle_pay(obj["command"])
+
+    def handle_pay(self, cmd: dict) -> None:
+        command_id, ref = str(cmd.get("commandId") or ""), str(cmd.get("ref") or "")
+        try:
+            amount = long_field(cmd, "amountCents")
+        except (ValueError, TypeError):
+            amount = -1
+        if not command_id or not ref or amount <= 0:
+            log.warning(f"[cloud] PayCommand dropped (commandId/ref missing or amount ≤ 0): {cmd}")
+            return
+        # Claim the ref until its result is recorded. An overlapping delivery of the
+        # same ref (SSE re-delivery racing the pending fetch) waits and re-posts that
+        # result rather than reaching NapsPay and posting a DUPLICATE decline first.
+        with self._claims_lock:
+            existing = self.emu.state.transactions.get(ref)
+            done = existing is not None and existing["status"] != "pending"
+            claim = None if done else self._claims.get(ref)
+            owner = not done and claim is None
+            if owner:
+                claim = self._claims[ref] = threading.Event()
+        if not owner:
+            if claim is not None:
+                while not claim.wait(0.1):
+                    if self.stop_event.is_set():
+                        return
+                existing = self.emu.state.transactions.get(ref)
+                if existing is None or existing["status"] == "pending":
+                    return      # the first delivery was abandoned (stop)
+            log.info(f"[cloud] PayCommand ref={ref} already {existing['status']} — re-posting, no re-charge")
+            self.post_result(command_id, stored_result(existing), is_reversal=False)
+            return
+        try:
+            result = self.emu.engine.pay(ref, amount, source=f"cloud ({command_id[:8]})", cancel=self.stop_event)
+            if self.stop_event.is_set():
+                return
+            self.emu.state.record(completed_tx(ref, amount, result["status"], result, cmd, None,
+                                               int(time.time() * 1000)))
+        finally:
+            with self._claims_lock:
+                self._claims.pop(ref, None).set()
+        log.info(f"[cloud] PayCommand {command_id} ref={ref} amount={amount} → {describe(result)}")
+        self.post_result(command_id, result, is_reversal=False)
+
+    def handle_reverse(self, cmd: dict) -> None:
+        command_id, ref, stan = (str(cmd.get(k) or "") for k in ("commandId", "ref", "stan"))
+        if not command_id or not ref or not stan:
+            log.warning(f"[cloud] ReverseCommand dropped (commandId/ref/stan missing): {cmd}")
+            return
+        result = self.emu.engine.reversal(ref, stan, cancel=self.stop_event)
+        if self.stop_event.is_set():
+            return
+        log.info(f"[cloud] ReverseCommand {command_id} ref={ref} stan={stan} → "
+                 f"{result_payload(result, True)['status']}")
+        self.post_result(command_id, result, is_reversal=True)
+
+    def ack_ping(self) -> None:
+        try:
+            self.request("POST", "/cloud/ping", b"{}").close()
+        except Exception as e:
+            log.warning(f"[cloud] ping ack failed: {e}")
+
+    def post_result(self, command_id: str, result: dict, is_reversal: bool) -> None:
+        """One attempt, like the terminal; the cloud's long-poll owns retries."""
+        if self.stop_event.is_set():
+            return
+        payload = result_payload(result, is_reversal)
+        body = android_json_bytes(payload)
+        try:
+            with self.request("POST", f"/cloud/pay/{command_id}/result", body) as r:
+                log.info(f"[cloud] result posted commandId={command_id} status={payload['status']} → HTTP {r.status}")
+        except urllib.error.HTTPError as e:
+            log.warning(f"[cloud] result post commandId={command_id} → HTTP {e.code}")
+        except Exception as e:
+            log.warning(f"[cloud] result post commandId={command_id} failed: {e}")
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(f"[cloud]   result: {body.decode()}")
 
 
-# ── Self-check ──────────────────────────────────────────────────────────────
+# ── Banner ────────────────────────────────────────────────────────────────────
+
+def print_banner(emu: Emulator, cloud_base: str | None) -> None:
+    cfg = emu.cfg
+    lines = []
+    if cfg.lan:
+        ip = lan_ip()
+        lines += [f"{'HTTP':<12}{cfg.host}:{emu.lan_port}",
+                  f"{'LAN URL':<12}http://{ip}:{emu.lan_port}",
+                  f"{'Discovery':<12}UDP {cfg.host}:{emu.udp_port} (beacon {'on' if cfg.beacon else 'off'})"]
+    else:
+        lines.append(f"{'LAN':<12}disabled (--no-lan)")
+    lines += [f"{'Device':<12}{cfg.serial} · {cfg.model} · v{VERSION}",
+              f"{'Mode':<12}{cfg.mode}"]
+    if cfg.mode in ("error", "reversal_decline"):
+        rc = resolve_code(cfg.code)
+        lines.append(f"{'Code':<12}{rc} — {code_label(rc)}")
+    if cfg.mode == "decline":
+        lines.append(f"{'Code':<12}100 — Do not honour")
+    if cfg.mode in ("timeout", "reversal_timeout"):
+        lines.append(f"{'Timeout':<12}{cfg.timeout_after:g} s")
+    if cfg.delay:
+        lines.append(f"{'Card delay':<12}{cfg.delay:g} s")
+    lines += [f"{'Magic':<12}…00 approve · …05 decline · …08 cancel · …51 timeout",
+              f"{'Admin key':<12}{emu.state.admin_key}",
+              f"{'State':<12}{cfg.state_file}"]
+    if cloud_base:
+        lines += [f"{'Cloud':<12}{api_root(cloud_base)}", f"{'Console':<12}p = new cloud pairing code"]
+    say()
+    say(boxed(f"Aslan Omni Terminal Emulator v{VERSION}", lines))
+    say()
+    say("  Ctrl-C to stop\n")
+
+
+# ── Self-check ────────────────────────────────────────────────────────────────
+
 def run_selfcheck() -> bool:
-    store = PairingStore()
-    sid, pin = store.begin("SELF", "Self")
-    tok = store.confirm(sid, pin, "SELF", "Self")
-    token_id, secret_hex = tok["tokenId"], tok["tokenSecret"]
-    derived = hmac_hex(bytes.fromhex(secret_hex), token_id.encode())
-    ts = str(int(time.time()))
-    body = b'{"ref":"SC","amountCents":1000}'
-    sig = hmac_hex(bytes.fromhex(derived), f"{token_id}:{ts}:POST:/pay:{sha256_hex(body)}".encode())
-    ok, err = store.verify(token_id, ts, "POST", "/pay", body, sig)
-    print("selfcheck:", "OK" if ok else f"FAIL ({err})")
+    """Pair, sign a /pay and answer a discovery probe without any socket."""
+    global QUIET
+    QUIET = True
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(state_file=os.path.join(tmp, "terminal.json"), lan=False)
+        emu = Emulator(cfg)
+        json_h = {"Content-Type": "application/json"}
+        r = emu.api.handle("POST", "/pair/request", json_h,
+                           b'{"posId":"SELF","posLabel":"Self","clientNonce":"n"}', "127.0.0.1")
+        sid = r.body["sessionId"]
+        r = emu.api.handle("POST", "/pair/confirm", json_h,
+                           json.dumps({"sessionId": sid, "pin": emu.state.last_pin}).encode(), "127.0.0.1")
+        token_id, secret = r.body["tokenId"], bytes.fromhex(r.body["tokenSecret"])
+        body = b'{"ref":"SELFCHECK","amountCents":1000}'
+        ts = str(int(time.time()))
+        sig = lan_signature(hmac_hex(secret, token_id.encode()), token_id, ts, "POST", "/pay", body)
+        r = emu.api.handle("POST", "/pay", {"Authorization": f"OMNI-TOKEN tokenId={token_id},ts={ts},sig={sig}"},
+                           body, "127.0.0.1")
+        pay_ok = r.status == 200 and r.body["status"] == "approved"
+        reply = json.loads(discovery_reply(emu.state, cfg, "abc"))
+        disc_ok = reply["hmac"] == hmac_hex(emu.state.discovery_key, b"abc")
+    ok = pay_ok and disc_ok
+    print("selfcheck:", "OK" if ok else f"FAIL (pay={pay_ok} discovery={disc_ok})")
     return ok
 
 
-# ── main ────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Aslan Omni terminal + cloud-device emulator")
-    p.add_argument("--lan-port", type=int, default=8080)
-    p.add_argument("--udp-port", type=int, default=8481)
-    p.add_argument("--no-lan", action="store_true")
-    p.add_argument("--serial", default=f"EMU-{socket.gethostname()}")
-    p.add_argument("--relay", nargs="?", const="https://staging-api.aslanpay.ma", default=None,
-                   help="Enable cloud half against BASE (default staging).")
-    p.add_argument("--device-token", default=os.environ.get("OMNI_DEVICE_TOKEN"))
-    p.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
-    p.add_argument("--save-token", action="store_true")
-    p.add_argument("--reset", action="store_true")
-    p.add_argument("--mode", default="approve",
-                   choices=["approve", "decline", "error", "interactive", "timeout"])
-    p.add_argument("--code", default="909")
-    p.add_argument("--selfcheck", action="store_true")
-    p.add_argument("--debug", action="store_true")
+    p = argparse.ArgumentParser(
+        description="Aslan Omni terminal emulator (LAN + cloud device)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--host", default="0.0.0.0", help="Bind address for HTTP and UDP (default: 0.0.0.0)")
+    p.add_argument("--lan-port", type=int, default=HTTP_PORT, help=f"HTTP port (default: {HTTP_PORT})")
+    p.add_argument("--udp-port", type=int, default=UDP_PORT, help=f"UDP discovery port (default: {UDP_PORT})")
+    p.add_argument("--no-lan", action="store_true", help="Disable the LAN half (cloud-only run)")
+    p.add_argument("--no-beacon", action="store_true", help="Do not broadcast OMNI-BEACON every 30 s")
+    p.add_argument("--serial", default=Config.serial, help="Device serial (discovery, claim)")
+    p.add_argument("--model", default=DEFAULT_MODEL, help=f"Terminal model (default: {DEFAULT_MODEL})")
+    p.add_argument("--terminal-id", default=Config.terminal_id, help="Acquirer terminal id on approvals")
+    p.add_argument("--merchant-id", default=Config.merchant_id, help="Acquirer merchant id on approvals")
+    p.add_argument("--mode", default="approve", choices=MODES, help="Outcome mode (default: approve)")
+    p.add_argument("--code", default=DEFAULT_CODE,
+                   help="RC for --mode error / reversal_decline — number (116) or scenario name "
+                        "(insufficient_funds). Default: 909")
+    p.add_argument("--delay", type=float, default=0.0, help="Simulated card time in seconds (default: 0)")
+    p.add_argument("--timeout-after", type=float, default=PAYMENT_TIMEOUT_SEC,
+                   help=f"Wait before a timeout outcome in timeout modes (default: {PAYMENT_TIMEOUT_SEC})")
+    p.add_argument("--state-file", default=DEFAULT_STATE_FILE, help=f"Terminal state (default: {DEFAULT_STATE_FILE})")
+    p.add_argument("--fresh", action="store_true", help="Start from empty state (tokens, transactions, keys)")
+    p.add_argument("--relay", nargs="?", const=CLOUD_BASE, default=None, metavar="BASE",
+                   help=f"Also run as a cloud device against BASE (default: {CLOUD_BASE})")
+    p.add_argument("--device-token", default=os.environ.get("OMNI_DEVICE_TOKEN"),
+                   help="Cloud device token (default: $OMNI_DEVICE_TOKEN)")
+    p.add_argument("--token-file", default=DEFAULT_TOKEN_FILE, help=f"Device token cache (default: {DEFAULT_TOKEN_FILE})")
+    p.add_argument("--save-token", action="store_true", help="Persist --device-token to the token file")
+    p.add_argument("--reset", action="store_true", help="Delete the cached device token (re-onboard with --relay)")
+    p.add_argument("--selfcheck", action="store_true", help="Verify pairing, signing and discovery, then exit")
+    p.add_argument("--debug", action="store_true", help="Log request and response bodies")
     args = p.parse_args()
 
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     if args.selfcheck:
         sys.exit(0 if run_selfcheck() else 1)
-
     if args.reset:
         removed = reset_device_token(args.token_file)
-        print(f"[reset] {'deleted ' + args.token_file if removed else 'no cached token'}")
+        log.info(f"[reset] {'deleted ' + args.token_file if removed else 'no cached device token'}")
         if not args.relay:
             return
+    if args.no_lan and not args.relay:
+        p.error("--no-lan needs --relay (nothing would run)")
 
-    ctx = EmulatorContext(args.mode, args.code, serial=args.serial, debug=args.debug)
-    stop = threading.Event()
-    threads: list[threading.Thread] = []
+    cfg = Config(mode=args.mode, code=args.code, delay=args.delay, timeout_after=args.timeout_after,
+                 terminal_id=args.terminal_id, merchant_id=args.merchant_id, serial=args.serial,
+                 model=args.model, host=args.host, lan_port=args.lan_port, udp_port=args.udp_port,
+                 lan=not args.no_lan, beacon=not args.no_beacon, state_file=args.state_file, fresh=args.fresh)
+    try:
+        emu = Emulator(cfg)
+    except StateFileError as e:
+        log.error(f"{e} — fix or move the file, or pass --fresh (or another --state-file) to start over")
+        sys.exit(1)
+    try:
+        emu.start()
+    except OSError as e:
+        log.error(f"Cannot bind {cfg.host} (HTTP {cfg.lan_port} / UDP {cfg.udp_port}) — {e}")
+        sys.exit(1)
+    print_banner(emu, args.relay)
 
-    if not args.no_lan:
-        httpd = make_lan_server("127.0.0.1", args.lan_port, ctx)
-        threads.append(threading.Thread(target=httpd.serve_forever, daemon=True))
-        threads.append(threading.Thread(target=run_udp_discovery,
-                                        args=("", args.udp_port, ctx, stop), daemon=True))
-        print(f"LAN terminal: http://127.0.0.1:{args.lan_port}  (discovery UDP :{args.udp_port})")
-
+    cloud = None
     if args.relay:
-        rec = acquire_device_token(args.relay, args.token_file, args.device_token,
-                                   args.save_token, args.serial)
-        threads.append(threading.Thread(
-            target=run_cloud_relay, args=(args.relay, ctx, rec["deviceToken"], stop), daemon=True))
-        print(f"Cloud relay: {args.relay}")
+        try:
+            token = acquire_device_token(args.relay, cfg, args.token_file, args.device_token, args.save_token)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log.error(f"[cloud] cannot get a device token from {api_root(args.relay)} — {e}")
+            emu.stop()
+            sys.exit(1)
+        cloud = CloudDevice(args.relay, token, emu)
+        CONSOLE_COMMANDS["p"] = cloud.initiate_pairing
+        cloud.start()
+    if args.mode == "interactive" or cloud:
+        threading.Thread(target=_stdin_reader, daemon=True).start()
 
-    for t in threads:
-        t.start()
-    print(f"Emulator ready (mode={args.mode}). Ctrl-C to stop.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        stop.set()
-        print("\nBye.")
+        say("\n  Stopped.")
+    finally:
+        if cloud:
+            cloud.stop()
+        emu.stop()
 
 
 if __name__ == "__main__":
