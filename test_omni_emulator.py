@@ -643,7 +643,8 @@ class FakeCloud:
     def __init__(self, token: str = DEVICE_TOKEN) -> None:
         self.token = token
         self.events: queue.Queue = queue.Queue()
-        self.results: list[tuple[str, bytes, dict]] = []
+        self.results: list[tuple[str, bytes, dict]] = []    # accepted, first per commandId
+        self.rejected: list[tuple[str, dict]] = []          # later posts for a completed command
         self.pings: list[bytes] = []
         self.initiates = 0
         self.stream_opens = 0
@@ -654,6 +655,7 @@ class FakeCloud:
         self.demo_token: str | None = None
         self.claim_polls = 0
         self.stop = threading.Event()
+        self.lock = threading.Lock()
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -712,7 +714,11 @@ class FakeCloud:
                     return self._json(200, {"command": cmd})
                 m = re.fullmatch(r"/cloud/pay/([^/]+)/result", path)
                 if m and self.command == "POST":
-                    fake.results.append((m.group(1), body, json.loads(body)))
+                    with fake.lock:     # cloud.ts: command.status !== "pending" → 409
+                        if fake.result_for(m.group(1)) is not None:
+                            fake.rejected.append((m.group(1), json.loads(body)))
+                            return self._json(409, {"error": "Command already completed"})
+                        fake.results.append((m.group(1), body, json.loads(body)))
                     return self._json(200, {"ok": True})
                 if path == "/cloud/stream":
                     return self._stream()
@@ -841,6 +847,34 @@ class CloudTests(unittest.TestCase):
         self.wait_result("good")
         time.sleep(0.2)
         self.assertEqual([r[0] for r in self.fake.results], ["good"])
+
+    def test_overlapping_deliveries_share_the_first_result(self):
+        self.start_device(delay=0.3)
+        # Same command re-delivered while the card is still being read (SSE vs pending fetch).
+        self.fake.push("PayCommand", {"commandId": "same", "ref": "OVL", "amountCents": 1000})
+        self.fake.push("PayCommand", {"commandId": "same", "ref": "OVL", "amountCents": 1000})
+        self.fake.push("PayCommand", {"commandId": "other", "ref": "OVL", "amountCents": 1000})
+        first = self.wait_result("same")[2]
+        other = self.wait_result("other")[2]
+        self.assertEqual(first["status"], "approved")          # no DUPLICATE decline won the race
+        self.assertEqual((other["status"], other["stan"]), ("approved", first["stan"]))
+        self.assertTrue(wait_until(lambda: len(self.fake.rejected) == 1))
+        self.assertEqual(self.fake.rejected[0][1]["stan"], first["stan"])
+        self.assertNotIn("DUPLICATE", json.dumps([r[2] for r in self.fake.results] + self.fake.rejected))
+
+    def test_stop_cancels_in_flight_payment(self):
+        dev = self.start_device(delay=30)
+        self.fake.push("PayCommand", {"commandId": "slow", "ref": "SLOW", "amountCents": 1000})
+        self.assertTrue(wait_until(lambda: "SLOW" in self.emu.engine._inflight))
+        t0 = time.time()
+        dev.stop()
+        self.assertLess(time.time() - t0, 3)
+        self.assertEqual(dev._workers, set())                  # every handler joined
+        self.fake.push("PayCommand", {"commandId": "late", "ref": "LATE", "amountCents": 1000})
+        time.sleep(0.3)
+        self.assertEqual(self.fake.results, [])
+        self.assertNotIn("SLOW", self.emu.state.transactions)
+        self.assertNotIn("LATE", self.emu.state.transactions)
 
     def test_reverse_command(self):
         self.start_device()

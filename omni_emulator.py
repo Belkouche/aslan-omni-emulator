@@ -391,7 +391,8 @@ def _stdin_reader() -> None:
             say(f"  Unknown command {line!r}" + ("  (p = new cloud pairing code)" if CONSOLE_COMMANDS else ""))
 
 
-def ask_operator(source: str, ref: str, amount_cents: int, timeout: float) -> tuple[str, str | None]:
+def ask_operator(source: str, ref: str, amount_cents: int, timeout: float,
+                 cancel: threading.Event | None = None) -> tuple[str, str | None]:
     """
     Prompt the operator for one payment. Returns (choice, rc) where choice is
     approve / decline / cancel / timeout. One prompt at a time.
@@ -412,11 +413,16 @@ def ask_operator(source: str, ref: str, amount_cents: int, timeout: float) -> tu
         if not QUIET:
             print("  Choice → ", end="", flush=True)
         _prompt_active.set()
+        deadline = time.monotonic() + timeout
         try:
             while True:
                 try:
-                    answer = _stdin_queue.get(timeout=timeout)
+                    answer = _stdin_queue.get(timeout=max(0.0, min(0.1, deadline - time.monotonic())))
                 except queue.Empty:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    if time.monotonic() < deadline:
+                        continue
                     say("(timeout → auto-approve)")
                     return "approve", None
                 if answer in ("a", "approve", "y", "yes", ""):
@@ -464,6 +470,10 @@ class Config:
     fresh: bool = False
 
 
+class Cancelled(Exception):
+    """The emulator is shutting down while a simulated payment waits."""
+
+
 def generate_stan() -> str: return f"{random.randint(1, 999999):06d}"
 def generate_auth() -> str: return f"{random.randint(100000, 999999)}"
 
@@ -496,19 +506,27 @@ class OutcomeEngine:
     def _declined(rc: str) -> dict:
         return {"status": "declined", "responseCode": rc}
 
-    def _timeout(self, wait: bool) -> dict:
-        if wait and self.cfg.timeout_after > 0:
-            time.sleep(self.cfg.timeout_after)
+    @staticmethod
+    def _wait(seconds: float, cancel: threading.Event | None) -> None:
+        if seconds <= 0:
+            return
+        if cancel is None:
+            time.sleep(seconds)
+        elif cancel.wait(seconds):
+            raise Cancelled()
+
+    def _timeout(self, wait: bool, cancel: threading.Event | None = None) -> dict:
+        if wait:
+            self._wait(self.cfg.timeout_after, cancel)
         return {"status": "timeout"}
 
-    def pay(self, ref: str, amount_cents: int, source: str) -> dict:
+    def pay(self, ref: str, amount_cents: int, source: str, cancel: threading.Event | None = None) -> dict:
         with self._lock:
             if ref in self._inflight:       # NapsPayBridge: same ref already on screen
                 return self._declined("DUPLICATE")
             self._inflight.add(ref)
         try:
-            if self.cfg.delay > 0:
-                time.sleep(self.cfg.delay)
+            self._wait(self.cfg.delay, cancel)
             forced = magic_outcome(amount_cents)
             if forced == "approved":  return self._approved()
             if forced == "declined":  return self._declined("005")
@@ -523,9 +541,9 @@ class OutcomeEngine:
             if mode == "cancel":
                 return {"status": "cancelled", "responseCode": "099"}
             if mode == "timeout":
-                return self._timeout(wait=True)
+                return self._timeout(wait=True, cancel=cancel)
             if mode == "interactive":
-                choice, rc = ask_operator(source, ref, amount_cents, self.cfg.interactive_timeout)
+                choice, rc = ask_operator(source, ref, amount_cents, self.cfg.interactive_timeout, cancel)
                 if choice == "decline": return self._declined(rc)
                 if choice == "cancel":  return {"status": "cancelled", "responseCode": "099"}
                 if choice == "timeout": return self._timeout(wait=False)
@@ -534,13 +552,12 @@ class OutcomeEngine:
             with self._lock:
                 self._inflight.discard(ref)
 
-    def reversal(self, ref: str, stan: str) -> dict:
-        if self.cfg.delay > 0:
-            time.sleep(self.cfg.delay)
+    def reversal(self, ref: str, stan: str, cancel: threading.Event | None = None) -> dict:
+        self._wait(self.cfg.delay, cancel)
         if self.cfg.mode == "reversal_decline":
             return self._declined(resolve_code(self.cfg.code))
         if self.cfg.mode == "reversal_timeout":
-            return self._timeout(wait=True)
+            return self._timeout(wait=True, cancel=cancel)
         return self._approved()
 
 
@@ -1235,6 +1252,10 @@ class CloudDevice:
         self.connected = threading.Event()
         self.pairing_code: str | None = None
         self._resp = None
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
+        self._claims: dict[str, threading.Event] = {}   # ref → set when its payment is recorded
+        self._claims_lock = threading.Lock()
 
     def request(self, method: str, path: str, body: bytes | None = None, stream: bool = False):
         headers = {"Authorization": device_auth_header(self.token, method, path, body or b""),
@@ -1246,18 +1267,41 @@ class CloudDevice:
         req = urllib.request.Request(self.root + path, data=body, method=method, headers=headers)
         return urllib.request.urlopen(req, timeout=None if stream else 30)
 
-    def start(self) -> None:
-        threading.Thread(target=self.initiate_pairing, daemon=True).start()
-        threading.Thread(target=self._run, daemon=True).start()
+    def _spawn(self, target, *args) -> None:
+        """Run a handler on a tracked worker thread; refused once stop() has begun."""
+        def work():
+            try:
+                target(*args)
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
 
-    def stop(self) -> None:
-        self.stop_event.set()
+        with self._workers_lock:
+            if self.stop_event.is_set():
+                return
+            t = threading.Thread(target=work, daemon=True)
+            self._workers.add(t)
+            t.start()
+
+    def start(self) -> None:
+        self._spawn(self.initiate_pairing)
+        self._spawn(self._run)
+
+    def stop(self, join_timeout: float = 5.0) -> None:
+        """Like CloudSyncManager.stop(): cancel the stream and every in-flight handler."""
+        with self._workers_lock:
+            self.stop_event.set()
+            workers = list(self._workers)
         # close() would block on the reader thread's buffer lock; shutting the
         # socket down makes the blocked read1() return instead.
         try:
             self._resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
         except Exception:
             pass
+        deadline = time.monotonic() + join_timeout
+        for t in workers:
+            if t is not threading.current_thread():
+                t.join(max(0.0, deadline - time.monotonic()))
 
     def initiate_pairing(self) -> None:
         """POST /cloud/pair/initiate — a code the POS enters in pairCloud()."""
@@ -1282,12 +1326,12 @@ class CloudDevice:
                 log.info("[cloud] SSE connected")
                 backoff = self.backoff_base
                 self.connected.set()
-                threading.Thread(target=self.fetch_pending, daemon=True).start()
+                self._spawn(self.fetch_pending)
                 for event, data in sse_events(self._resp):
                     if self.stop_event.is_set():
                         break
                     # Own thread per event: the reader must keep draining the stream (and Pings).
-                    threading.Thread(target=self._dispatch, args=(event, data), daemon=True).start()
+                    self._spawn(self._dispatch, event, data)
                 log.warning("[cloud] SSE stream closed")
             except Exception as e:
                 if self.stop_event.is_set():
@@ -1314,6 +1358,8 @@ class CloudDevice:
                 log.info("[cloud] PairingRevoked — a POS pairing was revoked")
         except json.JSONDecodeError:
             log.warning(f"[cloud] malformed {event}: {data[:80]}")
+        except Cancelled:
+            log.info(f"[cloud] {event} abandoned: emulator stopping")
         except Exception as e:
             log.warning(f"[cloud] {event} handling failed: {e!r}")
 
@@ -1337,14 +1383,36 @@ class CloudDevice:
         if not command_id or not ref or amount <= 0:
             log.warning(f"[cloud] PayCommand dropped (commandId/ref missing or amount ≤ 0): {cmd}")
             return
-        existing = self.emu.state.transactions.get(ref)
-        if existing is not None and existing["status"] != "pending":
+        # Claim the ref until its result is recorded. An overlapping delivery of the
+        # same ref (SSE re-delivery racing the pending fetch) waits and re-posts that
+        # result rather than reaching NapsPay and posting a DUPLICATE decline first.
+        with self._claims_lock:
+            existing = self.emu.state.transactions.get(ref)
+            done = existing is not None and existing["status"] != "pending"
+            claim = None if done else self._claims.get(ref)
+            owner = not done and claim is None
+            if owner:
+                claim = self._claims[ref] = threading.Event()
+        if not owner:
+            if claim is not None:
+                while not claim.wait(0.1):
+                    if self.stop_event.is_set():
+                        return
+                existing = self.emu.state.transactions.get(ref)
+                if existing is None or existing["status"] == "pending":
+                    return      # the first delivery was abandoned (stop)
             log.info(f"[cloud] PayCommand ref={ref} already {existing['status']} — re-posting, no re-charge")
             self.post_result(command_id, stored_result(existing), is_reversal=False)
             return
-        result = self.emu.engine.pay(ref, amount, source=f"cloud ({command_id[:8]})")
-        self.emu.state.record(completed_tx(ref, amount, result["status"], result, cmd, None,
-                                           int(time.time() * 1000)))
+        try:
+            result = self.emu.engine.pay(ref, amount, source=f"cloud ({command_id[:8]})", cancel=self.stop_event)
+            if self.stop_event.is_set():
+                return
+            self.emu.state.record(completed_tx(ref, amount, result["status"], result, cmd, None,
+                                               int(time.time() * 1000)))
+        finally:
+            with self._claims_lock:
+                self._claims.pop(ref, None).set()
         log.info(f"[cloud] PayCommand {command_id} ref={ref} amount={amount} → {describe(result)}")
         self.post_result(command_id, result, is_reversal=False)
 
@@ -1353,7 +1421,9 @@ class CloudDevice:
         if not command_id or not ref or not stan:
             log.warning(f"[cloud] ReverseCommand dropped (commandId/ref/stan missing): {cmd}")
             return
-        result = self.emu.engine.reversal(ref, stan)
+        result = self.emu.engine.reversal(ref, stan, cancel=self.stop_event)
+        if self.stop_event.is_set():
+            return
         log.info(f"[cloud] ReverseCommand {command_id} ref={ref} stan={stan} → "
                  f"{result_payload(result, True)['status']}")
         self.post_result(command_id, result, is_reversal=True)
@@ -1366,6 +1436,8 @@ class CloudDevice:
 
     def post_result(self, command_id: str, result: dict, is_reversal: bool) -> None:
         """One attempt, like the terminal; the cloud's long-poll owns retries."""
+        if self.stop_event.is_set():
+            return
         payload = result_payload(result, is_reversal)
         body = android_json_bytes(payload)
         try:
@@ -1495,7 +1567,11 @@ def main() -> None:
                  terminal_id=args.terminal_id, merchant_id=args.merchant_id, serial=args.serial,
                  model=args.model, host=args.host, lan_port=args.lan_port, udp_port=args.udp_port,
                  lan=not args.no_lan, beacon=not args.no_beacon, state_file=args.state_file, fresh=args.fresh)
-    emu = Emulator(cfg)
+    try:
+        emu = Emulator(cfg)
+    except StateFileError as e:
+        log.error(f"{e} — fix or move the file, or pass --fresh (or another --state-file) to start over")
+        sys.exit(1)
     try:
         emu.start()
     except OSError as e:
