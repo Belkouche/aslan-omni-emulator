@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import omni_emulator as omni
@@ -674,6 +675,52 @@ class PersistenceTests(EmuTestCase):
         emu2.stop()
         emu3 = self.make_emu(fresh=True)
         self.assertEqual(self.pay("X", 1000, token, emu3)[:2], (401, {"error": "unknown token"}))
+
+
+class StateFileTests(unittest.TestCase):
+
+    def test_unreadable_state_fails_startup_and_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "terminal.json")
+            for content in (b"{corrupt", b"[1,2]", b"\xff\xfe", b'{"tokens":[1]}', b'{"transactions":{"R":{}}}'):
+                with open(path, "wb") as fh:
+                    fh.write(content)
+                with self.assertRaises(omni.StateFileError):
+                    omni.Emulator(omni.Config(lan=False, state_file=path))
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), content)
+            emu = omni.Emulator(omni.Config(lan=False, state_file=path, fresh=True))   # explicit opt-in
+            with open(path) as fh:
+                self.assertEqual(json.load(fh)["adminKey"], emu.state.admin_key)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "needs POSIX permissions, non-root")
+    def test_permission_denied_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "terminal.json")
+            omni.Emulator(omni.Config(lan=False, state_file=path))
+            os.chmod(path, 0)
+            try:
+                with self.assertRaises(omni.StateFileError):
+                    omni.Emulator(omni.Config(lan=False, state_file=path))
+            finally:
+                os.chmod(path, 0o600)
+            with open(path) as fh:
+                self.assertIn("adminKey", json.load(fh))
+
+
+class BannerTests(unittest.TestCase):
+
+    def test_box_fits_terminal_and_wraps_long_values(self):
+        long_path = "/very/long/" + "nested/" * 30 + "terminal.json"
+        with unittest.mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
+            box = omni.boxed("Title", [f"{'State':<12}{long_path}", "short"])
+        lines = box.splitlines()
+        self.assertTrue(all(len(l) <= 80 for l in lines), max(map(len, lines)))
+        self.assertEqual(len({len(l) for l in lines}), 1)          # still a rectangle
+        self.assertIn("│  State       /very/long/", box)
+        content = [l[5:-1].rstrip() for l in lines[3:-2]]          # rows of the long value
+        self.assertTrue(all(c.startswith(" " * 12) for c in content[1:]))   # continuation indent
+        self.assertEqual(content[0] + "".join(c[12:] for c in content[1:]), f"{'State':<12}{long_path}")
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX file modes")

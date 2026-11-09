@@ -62,9 +62,11 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import socket
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.error
@@ -367,8 +369,13 @@ def say(text: str = "") -> None:
         print(text, flush=True)
 
 
-def boxed(title: str, lines: list[str]) -> str:
-    w = max([len(title) + 2] + [len(l) + 4 for l in lines] + [44])
+def boxed(title: str, lines: list[str], indent: int = 12) -> str:
+    """A box no wider than the terminal; long lines wrap with a continuation indent."""
+    max_w = max(44, shutil.get_terminal_size((80, 24)).columns - 4)
+    w = min(max_w, max([len(title) + 2] + [len(l) + 4 for l in lines] + [44]))
+    lines = [part for l in lines
+             for part in (textwrap.wrap(l, w - 4, subsequent_indent=" " * indent, break_on_hyphens=False)
+                          or [""])]
     out = [f"  ┌{'─' * w}┐", f"  │{title:^{w}}│", f"  ├{'─' * w}┤"]
     out += [f"  │  {l:<{w - 2}}│" for l in lines]
     out.append(f"  └{'─' * w}┘")
@@ -624,6 +631,10 @@ class PairRateLimiter:
             return True
 
 
+class StateFileError(Exception):
+    """The state file exists but cannot be used; it is left untouched."""
+
+
 class TerminalState:
     """
     What the terminal keeps in Room + settings: paired POS tokens, transactions,
@@ -635,10 +646,15 @@ class TerminalState:
         self.path = path
         self.lock = threading.RLock()
         data = {} if fresh else self._load()
-        self.admin_key: str = data.get("adminKey") or secrets.token_urlsafe(24)
-        self.discovery_key = bytes.fromhex(data.get("discoveryKey") or secrets.token_hex(32))
-        self.tokens: dict[str, dict] = data.get("tokens", {})
-        self.transactions: dict[str, dict] = data.get("transactions", {})
+        try:
+            self.admin_key: str = data.get("adminKey") or secrets.token_urlsafe(24)
+            self.discovery_key = bytes.fromhex(data.get("discoveryKey") or secrets.token_hex(32))
+            self.tokens: dict[str, dict] = dict(data.get("tokens", {}))
+            self.transactions: dict[str, dict] = dict(data.get("transactions", {}))
+            for tx in self.transactions.values():
+                tx["status"], tx.get("createdAt")
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            raise StateFileError(f"state file {path} has an unexpected shape ({e!r})") from None
         self.sessions: dict[str, dict] = {}
         self.limiter = PairRateLimiter()
         self.last_pin: str | None = None    # test hook: the PIN shown on screen
@@ -648,14 +664,17 @@ class TerminalState:
         self.save()
 
     def _load(self) -> dict:
+        """Absent file → empty state. Anything unreadable is fatal: never overwrite keys and tokens."""
         try:
             with open(self.path, encoding="utf-8") as fh:
-                return json.load(fh)
+                data = json.load(fh)
         except FileNotFoundError:
             return {}
-        except (json.JSONDecodeError, OSError) as e:
-            log.warning(f"ignoring unreadable state file {self.path}: {e}")
-            return {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise StateFileError(f"cannot read state file {self.path}: {e}") from None
+        if not isinstance(data, dict):
+            raise StateFileError(f"state file {self.path} is not a JSON object")
+        return data
 
     def save(self) -> None:
         with self.lock:
